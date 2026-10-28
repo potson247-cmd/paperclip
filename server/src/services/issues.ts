@@ -1,3 +1,4 @@
+import { retireReviewerIntents, reviewerIntentPredicate } from "./heartbeat/reviewer-assignment-continuation.js";
 import { notifyApprovalWork } from "./approval-work-notifications.js";
 import { notifyDecisionTargetWork, notifyDecisionTargetIssueRemoval } from "./decision-targets.js";
 import { assertOnboardingFirstTaskCreationAllowed } from "./onboarding-first-task-admission.js";
@@ -11388,6 +11389,7 @@ export function issueService(db: Db) {
           await tx.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: new Date(), updatedAt: new Date() })
             .where(and(eq(agentWakeupRequests.companyId, receiptExisting.companyId),
               eq(agentWakeupRequests.requestedByActorType, "user"),
+              sql`NOT (${reviewerIntentPredicate})`,
               sql`coalesce(${agentWakeupRequests.payload}->>'issueId', ${agentWakeupRequests.payload}->>'taskId',
                 ${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'issueId',
                 ${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'taskId') = ${id}`));
@@ -11423,6 +11425,10 @@ export function issueService(db: Db) {
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;
+        if (updated.status === "done" || updated.status === "cancelled") {
+          await retireReviewerIntents(tx, { companyId: updated.companyId, issueId: updated.id,
+            reason: `Task was marked ${updated.status}` });
+        }
         if (updated.status === "done") {
           await completeTerminalCaseHandoffsForIssue(tx, { companyId: updated.companyId, issueId: updated.id,
             publications: activityPublications });
