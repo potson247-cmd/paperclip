@@ -1,5 +1,6 @@
 import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js";
 import { measureRunPhase } from "../execution-preparation-timing.js";
+import { acknowledgeReusedChatCompletionReply } from "../chat-completion-delivery.js";
 import { PROJECT_ACCESS_DENIED, ProjectAccessDeniedError } from "../project-access-denial.js";
 import { pendingCaseHandoffForRun } from "./case-handoff-lifecycle.js";
 import { NON_RETRYABLE_PREFLIGHT_FAILURE_CODES, isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
@@ -879,6 +880,18 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
               presentationSource: presentationDecision.chosenSource,
             },
           }));
+        } else if (
+          issueId &&
+          !skipRunIssueComment &&
+          presentationDecision.commentAction === "reuse" &&
+          presentationDecision.commentId
+        ) {
+          await acknowledgeReusedChatCompletionReply(db, {
+            companyId: livenessRun.companyId,
+            issueId,
+            runId: livenessRun.id,
+            commentId: presentationDecision.commentId,
+          });
         } else if (presentationDecision.commentAction === "create") {
           presentationDecision = {
             ...presentationDecision,
