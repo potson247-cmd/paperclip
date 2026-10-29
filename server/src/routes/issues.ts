@@ -13952,6 +13952,7 @@ export function issueRoutes(
         attachmentIds: commentAttachmentIds,
         reviewInteractionId: requestedReviewInteractionId,
         reviewRequest,
+        reviewDecision,
         reopen: reopenRequested,
         resume: resumeRequested,
         interrupt: interruptRequested,
@@ -14019,8 +14020,9 @@ export function issueRoutes(
         req.body.reviewPolicy !== undefined &&
         req.body.reviewPolicy !== existing.reviewPolicy;
       const reviewVerdictRequested =
-        existing.status === "in_review" &&
-        (updateFields.status === "done" || updateFields.status === "cancelled");
+        reviewDecision !== undefined ||
+        (existing.status === "in_review" &&
+          (updateFields.status === "done" || updateFields.status === "cancelled"));
       const mcpReviewSensitiveMutation = mcpParticipationChange;
       const reviewPolicySensitiveMutationRequested =
         mcpReviewSensitiveMutation || req.body.reviewPolicy !== undefined ||
@@ -14349,6 +14351,7 @@ export function issueRoutes(
         allowBoardOverride: req.actor.type === "board" && req.actor.source !== "mcp_oauth",
         commentBody,
         reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
+        reviewDecision,
         monitorExplicitlyUpdated:
           req.body.executionPolicy !== undefined && monitorChanged,
       });
@@ -14754,9 +14757,9 @@ export function issueRoutes(
           req.body.reviewPolicy !== undefined &&
           req.body.reviewPolicy !== lockedExisting.reviewPolicy;
         const lockedReviewVerdictRequested =
-          lockedExisting.status === "in_review" &&
-          (updateFields.status === "done" ||
-            updateFields.status === "cancelled");
+          reviewDecision !== undefined ||
+          (lockedExisting.status === "in_review" &&
+            (updateFields.status === "done" || updateFields.status === "cancelled"));
         if (
           (lockedReviewVerdictRequested || lockedPolicyChangeRequested) &&
           lockedExisting.reviewPolicy != null &&
