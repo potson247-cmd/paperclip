@@ -5645,6 +5645,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
             disableProjectInstructions: this.options.disableCodexProjectInstructions,
             readOnlyRoots: [
               ...trustedRuntimeReadOnlyRoots(this.options.environment),
+              ...trustedRuntimeReadOnlyRoots({ PATH: String(record(providerConfig.commandEnvironment).PATH ?? "") }),
               ...(runtimeContext
                 ? [
                     resolve(codexHome, "skills"),
