@@ -83,6 +83,9 @@ import {
 } from "../services/tool-access.js";
 import { accessService } from "../services/access.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import { createOAuthAuthorizationStart } from "../services/tool-access/oauth/authorization-start.js";
+import { createPersonalConnectionIdentity } from "../services/tool-access/connections/personal-identity.js";
+import { createConnectionSetupPolicy } from "../services/tool-access/connections/setup-policy.js";
 import { toolAccessPolicyService } from "../services/tool-access-policy.js";
 import { secretService } from "../services/secrets.js";
 import {
@@ -2620,6 +2623,63 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(reconnected.connection.agentInstructions).toEqual(settings);
   });
 
+  it.each(["managed", "customer"] as const)("preserves a %s Workspace draft's selection after declined and expired authorization", async (mode) => {
+    const company = await createCompany(db);
+    const userId = `workspace-draft-${randomUUID()}`;
+    await grantBoardUser(db, company.id, userId, [], "owner");
+    const actor = { actorType: "user" as const, actorId: userId };
+    const connector = fakeGoogleWorkspaceConnector(company.id, userId, "workspace.all");
+    const service = createTestToolAccessService(db, { paperclipCloudConnector: connector });
+    const connected = await service.connectGalleryApp(company.id, {
+      galleryKey: "google-workspace", grantKind: "user",
+      connectionMethodKey: mode === "managed" ? "paperclip-workspace" : "customer-workspace-oauth",
+      ...(mode === "customer" ? { oauthClient: { clientId: "fixture-client", clientSecret: "fixture-secret" } } : {}),
+    }, actor);
+    const redirectUri = "https://paperclip.example.test/api/tools/oauth/callback";
+    const [unstarted] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    const configWithProposals = { ...unstarted.config, oauth: { ...(unstarted.config.oauth as Record<string, unknown>), pendingWorkspaceServiceRequests: {
+      [userId]: { requestedScopes: googleWorkspaceSelectedScopes({ drive: "write" }), requestedAt: "2026-10-26T10:00:00Z" },
+      other: { requestedScopes: googleWorkspaceSelectedScopes({ calendar: "write" }), requestedAt: "2026-10-26T10:00:00Z" },
+    } } };
+    await db.update(toolConnections).set({ config: configWithProposals, transportConfig: configWithProposals }).where(eq(toolConnections.id, connected.connectionId));
+    const started = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri, actor, workspaceServices: { gmail: "read" },
+    });
+    const state = new URL(started.authorizationUrl).searchParams.get("state")!;
+    if (mode === "managed") {
+      await expect(service.completePaperclipCloudConnectorCallback({ state, error: "access_denied", actor })).rejects.toMatchObject({ status: 400 });
+    } else {
+      await expect(service.completeOAuthCallback({ state, error: "access_denied", redirectUri, actor })).rejects.toMatchObject({ status: 400 });
+    }
+    const draft = await service.getConnection(connected.connectionId);
+    expect(draft.status).toBe("draft");
+    expect(draft.config.workspaceSetup).toEqual({
+      version: 1, companyId: company.id, connectionId: draft.id, actorType: "user", actorId: userId,
+      grantKind: "user", subjectId: userId,
+      requestedScopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+    });
+    expect((draft.config.oauth as typeof configWithProposals.oauth).pendingWorkspaceServiceRequests).toEqual({ other: configWithProposals.oauth.pendingWorkspaceServiceRequests.other });
+    const retained = await service.connectGalleryApp(company.id, {
+      galleryKey: "google-workspace", resumeConnectionId: draft.id,
+      connectionMethodKey: mode === "managed" ? "paperclip-workspace" : "customer-workspace-oauth",
+      ...(mode === "customer" ? { oauthClient: { clientId: "fixture-client" } } : {}),
+    }, actor);
+    expect(retained.connectionId).toBe(draft.id);
+    const resumed = await service.startOAuth(company.id, retained.connectionId, { redirectUri, actor });
+    const [resumedState] = await db.select().from(toolOauthStates).where(eq(toolOauthStates.state, new URL(resumed.authorizationUrl).searchParams.get("state")!));
+    expect(resumedState.requestedScopes).toEqual(["https://www.googleapis.com/auth/gmail.readonly"]);
+    await db.update(toolOauthStates).set({ expiresAt: new Date(Date.now() - 1000) }).where(eq(toolOauthStates.state, resumedState.state));
+    if (mode === "managed") {
+      await expect(service.completePaperclipCloudConnectorCallback({ state: resumedState.state, claimId: "expired", actor })).rejects.toMatchObject({ status: 400 });
+    } else {
+      await expect(service.completeOAuthCallback({ state: resumedState.state, code: "expired", redirectUri, actor })).rejects.toMatchObject({ status: 400 });
+    }
+    const coldService = createTestToolAccessService(db, { paperclipCloudConnector: connector });
+    const coldResume = await coldService.startOAuth(company.id, draft.id, { redirectUri, actor });
+    const [coldState] = await db.select().from(toolOauthStates).where(eq(toolOauthStates.state, new URL(coldResume.authorizationUrl).searchParams.get("state")!));
+    expect(coldState.requestedScopes).toEqual(["https://www.googleapis.com/auth/gmail.readonly"]);
+  });
+
   it.each(["user", "organization"] as const)("preserves the %s Workspace request when account-page reconnect omits a selection", async (kind) => {
     const company = await createCompany(db);
     const service = createTestToolAccessService(db);
@@ -2651,6 +2711,69 @@ describeEmbeddedPostgres("tool access service", () => {
       workspaceServices: { gmail: "read" },
     });
     expect(new URL(selected.authorizationUrl).searchParams.get("scope")?.split(" ")).toEqual(requestedScopes);
+  });
+
+  it("requires explicit selection for historical Workspace drafts and a different setup owner", async () => {
+    const company = await createCompany(db);
+    const userId = `workspace-owner-${randomUUID()}`;
+    const otherUserId = `workspace-owner-${randomUUID()}`;
+    await grantBoardUser(db, company.id, userId, [], "owner");
+    await grantBoardUser(db, company.id, otherUserId, [], "owner");
+    const actor = { actorType: "user" as const, actorId: userId };
+    const connector = fakeGoogleWorkspaceConnector(company.id, userId, "workspace.all");
+    const service = createTestToolAccessService(db, { paperclipCloudConnector: connector });
+    const connected = await service.connectGalleryApp(company.id, {
+      galleryKey: "google-workspace", connectionMethodKey: "paperclip-workspace", grantKind: "organization",
+    }, actor);
+    const redirectUri = "https://paperclip.example.test/api/tools/oauth/callback";
+    await expect(service.startOAuth(company.id, connected.connectionId, { redirectUri, actor })).rejects.toMatchObject({ status: 400 });
+    await service.startOAuth(company.id, connected.connectionId, { redirectUri, actor, workspaceServices: { gmail: "read" } });
+    await expect(service.startOAuth(company.id, connected.connectionId, {
+      redirectUri, actor: { actorType: "user", actorId: otherUserId },
+    })).rejects.toMatchObject({ status: 400 });
+    expect((await service.getConnection(connected.connectionId)).config.workspaceSetup).toMatchObject({ actorId: userId });
+  });
+
+  it.each(["credentialPolicy", "credentialSource", "authKind", "transport", "createdByUserId", "sourceTemplateKey", "connectionMethodKey"] as const)("rejects a Workspace draft whose %s changes during authorization", async (field) => {
+    const company = await createCompany(db);
+    const actor = { actorType: "user" as const, actorId: "board" };
+    const service = createTestToolAccessService(db);
+    const connected = await service.connectGalleryApp(company.id, {
+      galleryKey: "google-workspace", connectionMethodKey: "customer-workspace-oauth", grantKind: "organization",
+      oauthClient: { clientId: "fixture-client", clientSecret: "fixture-secret" },
+    }, actor);
+    const [original] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    const changed: Partial<typeof toolConnections.$inferInsert> = {};
+    if (field === "credentialPolicy") changed.credentialPolicy = "per_user";
+    else if (field === "credentialSource") {
+      changed.credentialSource = "vercel_connect";
+      changed.credentialRefs = [];
+      changed.credentialSecretRefs = [];
+      changed.externalCredential = { provider: "vercel_connect", connectorId: "fixture", connectorUid: "fixture", service: "google", principalMode: "user" };
+    }
+    else if (field === "authKind") changed.authKind = "none";
+    else if (field === "transport") changed.transport = "rest_api";
+    else if (field === "createdByUserId") changed.createdByUserId = "another-owner";
+    else changed.config = { ...original.config, [field]: "different" };
+    const start = createOAuthAuthorizationStart(db, {
+      now: () => new Date(),
+      getConnectionRow: async () => {
+        await db.update(toolConnections).set(changed).where(eq(toolConnections.id, original.id));
+        return original;
+      },
+      setupPolicy: createConnectionSetupPolicy(db),
+      fixedPersonalIdentityForReconnect: createPersonalConnectionIdentity(db),
+      currentCloudConnector: () => null,
+      vercelConnect: null,
+      ensureOAuthClient: vi.fn(),
+      oauthEndpointsForConnection: vi.fn(),
+      assertOAuthEndpointUrl: vi.fn(),
+    });
+    await expect(start(company.id, original.id, {
+      redirectUri: "https://paperclip.example.test/api/tools/oauth/callback", actor, workspaceServices: { gmail: "read" },
+    })).rejects.toMatchObject({ status: 409 });
+    expect((await service.getConnection(original.id)).config.workspaceSetup).toBeUndefined();
+    expect(await db.select().from(toolOauthStates).where(eq(toolOauthStates.connectionId, original.id))).toHaveLength(0);
   });
 
   it("binds selected Workspace service scopes to OAuth state and rejects other providers", async () => {
@@ -2686,7 +2809,7 @@ describeEmbeddedPostgres("tool access service", () => {
         oauthClient: { clientId: "test-workspace-client", clientSecret: "test-workspace-secret" },
       }, actor);
       const redirectUri = "https://paperclip.example.test/api/tools/oauth/callback";
-      const started = await service.startOAuth(company.id, connected.connectionId, { redirectUri, actor });
+      const started = await service.startOAuth(company.id, connected.connectionId, { redirectUri, actor, workspaceServices: GOOGLE_WORKSPACE_DEFAULT_SELECTION });
       const authorization = new URL(started.authorizationUrl);
       expect(authorization.searchParams.get("scope")?.split(" ")).toEqual(googleWorkspaceSelectedScopes(GOOGLE_WORKSPACE_DEFAULT_SELECTION));
       expect(authorization.searchParams.get("enable_granular_consent")).toBe("true");
@@ -2742,7 +2865,9 @@ describeEmbeddedPostgres("tool access service", () => {
       const redirectUri = `https://paperclip.example/api/tools/oauth/${mode === "managed" ? "cloud-connector/" : ""}callback`;
       for (const reconnect of [false, true]) {
         if (reconnect) await service.connectGalleryApp(company.id, { ...input, reconnectConnectionId: connected.connectionId }, actor);
-        const started = await service.startOAuth(company.id, connected.connectionId, { redirectUri, actor });
+        const started = await service.startOAuth(company.id, connected.connectionId, { redirectUri, actor,
+          ...(!reconnect ? { workspaceServices: GOOGLE_WORKSPACE_DEFAULT_SELECTION } : {}),
+        });
         const state = new URL(started.authorizationUrl).searchParams.get("state")!;
         const completed = mode === "managed"
           ? await service.completePaperclipCloudConnectorCallback({ state, claimId: "workspace-no-agents", actor })
@@ -7629,6 +7754,7 @@ describeEmbeddedPostgres("tool access service", () => {
       expect(workspaceApp.methods.map((method: { key: string }) => method.key)).toContain(methodKey);
       const connected = await request(app).post(`/api/companies/${company.id}/tools/apps/connect`).send({
         galleryKey: slug, connectionMethodKey: methodKey, grantKind: "user", name: `Personal ${slug}`,
+        ...(profile === "workspace.all" ? { workspaceServices: GOOGLE_WORKSPACE_DEFAULT_SELECTION } : {}),
       });
       expect(connected.status).toBe(201);
       expect(connected.body.connection).toMatchObject({ credentialPolicy: "per_user", ownership: "platform_shared" });
@@ -7691,6 +7817,7 @@ describeEmbeddedPostgres("tool access service", () => {
         .map((method: { key: string }) => method.key)).toContain(methodKey);
       const result = await request(app).post(`/api/companies/${company.id}/tools/apps/connect`).send({
         galleryKey: slug, connectionMethodKey: methodKey, grantKind: "user", name: `Cloud ${slug}`,
+        ...(profile === "workspace.all" ? { workspaceServices: GOOGLE_WORKSPACE_DEFAULT_SELECTION } : {}),
       });
       expect(result.status, JSON.stringify(result.body)).toBe(201);
       expect(result.body.auth.startUrl).toBe("https://my.paperclip.app/connections/confirm?id=test-workspace-session");
@@ -8297,6 +8424,7 @@ describeEmbeddedPostgres("tool access service", () => {
     }, actor);
     const started = await service.startOAuth(company.id, connected.connectionId, {
       redirectUri: "https://paperclip.example/api/tools/oauth/cloud-connector/callback", actor,
+      workspaceServices: GOOGLE_WORKSPACE_DEFAULT_SELECTION,
     });
     const completed = await service.completePaperclipCloudConnectorCallback({
       state: new URL(started.authorizationUrl).searchParams.get("state")!, claimId: "workspace-claim", actor,
@@ -8364,7 +8492,7 @@ describeEmbeddedPostgres("tool access service", () => {
         ...(mode === "customer" ? { oauthClient: { clientId: "workspace-client", clientSecret: "workspace-client-secret" } } : {}),
       }, actor);
       const redirectUri = mode === "managed" ? "https://paperclip.example/api/tools/oauth/cloud-connector/callback" : "https://paperclip.example/api/tools/oauth/callback";
-      const started = await service.startOAuth(company.id, connected.connectionId, { redirectUri, actor });
+      const started = await service.startOAuth(company.id, connected.connectionId, { redirectUri, actor, workspaceServices: GOOGLE_WORKSPACE_DEFAULT_SELECTION });
       const state = new URL(started.authorizationUrl).searchParams.get("state")!;
       const completed = mode === "managed"
         ? await service.completePaperclipCloudConnectorCallback({ state, claimId: "fixture", actor })
