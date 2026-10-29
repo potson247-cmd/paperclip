@@ -1,4 +1,7 @@
 import express from "express";
+import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_OPENCODE_LOCAL_MODEL } from "@paperclipai/adapter-opencode-local";
@@ -1199,7 +1202,7 @@ describe("agent permission routes", () => {
     expect(mockLogActivity).not.toHaveBeenCalled();
   }, 15_000);
 
-  it("blocks agent-authenticated instructions-path updates", async () => {
+  it("blocks agent-authenticated instructions-path updates to external paths", async () => {
     const app = await createApp({
       type: "agent",
       agentId,
@@ -1210,11 +1213,333 @@ describe("agent permission routes", () => {
 
     const res = await requestApp(app, (baseUrl) => request(baseUrl)
       .patch(`/api/agents/${agentId}/instructions-path`)
-      .send({ path: "/etc/passwd" }));
+      .send({ path: "/etc/passwd", adapterConfigKey: "instructionsFilePath" }));
 
     expect(res.status).toBe(403);
-    expect(res.body.error).toContain("instructions path or bundle configuration");
+    expect(res.body.error).toContain("managed (relative) instructions paths");
     expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it("allows agent to update its own instructions path with managed path", async () => {
+    mockAccessService.decide.mockResolvedValue({ allowed: true, reason: "allow" });
+    mockAgentService.getById.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: { cwd: "/tmp/instructions" },
+    });
+    mockAgentService.update.mockResolvedValue({
+      id: agentId,
+      adapterConfig: { instructionsFilePath: "instructions/ceo-delegation.md" },
+    });
+    mockSyncInstructionsBundleConfigFromFilePath.mockImplementation((_agent, config) => config);
+
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}/instructions-path`)
+      .send({ path: "instructions/ceo-delegation.md", adapterConfigKey: "instructionsFilePath" }));
+
+    expect(res.status).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalled();
+  });
+
+  it("blocks agent from updating another agent's instructions path", async () => {
+    const otherAgentId = "22222222-2222-4222-8222-222222222222";
+    mockAgentService.getById.mockResolvedValue({
+      id: otherAgentId,
+      adapterConfig: { instructionsFilePath: "instructions/old.md" },
+    });
+
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${otherAgentId}/instructions-path`)
+      .send({ path: "instructions/new.md", adapterConfigKey: "instructionsFilePath" }));
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("Agents can only manage their own instructions path");
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it("blocks agent from using non-instructions adapter config key", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}/instructions-path`)
+      .send({ path: "instructions/new.md", adapterConfigKey: "cwd" }));
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("instructions-path-related adapter configuration");
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it("blocks path traversal via ../ prefix", async () => {
+    mockAccessService.decide.mockResolvedValue({ allowed: true, reason: "allow" });
+    mockAgentService.getById.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: { cwd: "/tmp/instructions" },
+    });
+
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}/instructions-path`)
+      .send({ path: "../etc/passwd", adapterConfigKey: "instructionsFilePath" }));
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("Path traversal detected");
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it("blocks path traversal via nested ../ segments", async () => {
+    mockAccessService.decide.mockResolvedValue({ allowed: true, reason: "allow" });
+    mockAgentService.getById.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: { cwd: "/tmp/instructions" },
+    });
+
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}/instructions-path`)
+      .send({ path: "subdir/../../etc/passwd", adapterConfigKey: "instructionsFilePath" }));
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("Path traversal detected");
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it("treats percent-encoded sequences as literal filenames", async () => {
+    // Nothing downstream URI-decodes the persisted path, so validation must
+    // use the same literal representation: "%2e%2e" is a harmless filename,
+    // not traversal.
+    mockAccessService.decide.mockResolvedValue({ allowed: true, reason: "allow" });
+    mockAgentService.getById.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: { cwd: "/tmp/instructions" },
+    });
+    mockAgentService.update.mockResolvedValue({
+      id: agentId,
+      adapterConfig: { instructionsFilePath: "%2e%2e/%2e%2e/etc/passwd" },
+    });
+    mockSyncInstructionsBundleConfigFromFilePath.mockImplementation((_agent, config) => config);
+
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}/instructions-path`)
+      .send({ path: "%2e%2e/%2e%2e/etc/passwd", adapterConfigKey: "instructionsFilePath" }));
+
+    expect(res.status).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalled();
+  });
+
+  it("rejects agent instructions-path update when managed cwd is missing", async () => {
+    // Fail closed: with no managed root there is nothing to contain the path against.
+    mockAccessService.decide.mockResolvedValue({ allowed: true, reason: "allow" });
+    mockAgentService.getById.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: {},
+    });
+
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}/instructions-path`)
+      .send({ path: "instructions/new.md", adapterConfigKey: "instructionsFilePath" }));
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("managed working directory");
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it("rejects agent instructions-path update when managed cwd is not absolute", async () => {
+    mockAccessService.decide.mockResolvedValue({ allowed: true, reason: "allow" });
+    mockAgentService.getById.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: { cwd: "relative/path" },
+    });
+
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}/instructions-path`)
+      .send({ path: "instructions/new.md", adapterConfigKey: "instructionsFilePath" }));
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("managed working directory");
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it("rejects Windows-style absolute instructions paths", async () => {
+    mockAccessService.decide.mockResolvedValue({ allowed: true, reason: "allow" });
+    mockAgentService.getById.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: { cwd: "/tmp/instructions" },
+    });
+
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}/instructions-path`)
+      .send({ path: "C:\\Windows\\evil.md", adapterConfigKey: "instructionsFilePath" }));
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("managed (relative) instructions paths");
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it("blocks instructions path traversing a symlink outside the managed directory", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "paperclip-instructions-"));
+    const outside = await mkdtemp(path.join(tmpdir(), "paperclip-outside-"));
+    try {
+      await writeFile(path.join(outside, "secret.md"), "top secret", "utf8");
+      // "junction" needs no privilege on Windows and is a plain dir symlink elsewhere.
+      await symlink(outside, path.join(root, "link"), "junction");
+      mockAccessService.decide.mockResolvedValue({ allowed: true, reason: "allow" });
+      mockAgentService.getById.mockResolvedValue({
+        ...baseAgent,
+        adapterConfig: { cwd: root },
+      });
+
+      const app = await createApp({
+        type: "agent",
+        agentId,
+        companyId,
+        source: "agent_key",
+        runId: "run-1",
+      });
+
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}/instructions-path`)
+        .send({ path: "link/secret.md", adapterConfigKey: "instructionsFilePath" }));
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain("symlink");
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalled();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks instructions path when the managed directory itself is a symlink", async () => {
+    const target = await mkdtemp(path.join(tmpdir(), "paperclip-target-"));
+    const linkPath = `${target}-link`;
+    try {
+      // "junction" needs no privilege on Windows and is a plain dir symlink elsewhere.
+      await symlink(target, linkPath, "junction");
+      mockAccessService.decide.mockResolvedValue({ allowed: true, reason: "allow" });
+      mockAgentService.getById.mockResolvedValue({
+        ...baseAgent,
+        adapterConfig: { cwd: linkPath },
+      });
+
+      const app = await createApp({
+        type: "agent",
+        agentId,
+        companyId,
+        source: "agent_key",
+        runId: "run-1",
+      });
+
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}/instructions-path`)
+        .send({ path: "instructions.md", adapterConfigKey: "instructionsFilePath" }));
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain("symlink");
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalled();
+    } finally {
+      await rm(linkPath, { recursive: true, force: true });
+      await rm(target, { recursive: true, force: true });
+    }
+  });
+
+  it("allows valid relative path within managed directory", async () => {
+    mockAccessService.decide.mockResolvedValue({ allowed: true, reason: "allow" });
+    mockAgentService.getById.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: { cwd: "/tmp/instructions" },
+    });
+    mockAgentService.update.mockResolvedValue({
+      id: agentId,
+      adapterConfig: { instructionsFilePath: "subdir/instructions.md" },
+    });
+    mockSyncInstructionsBundleConfigFromFilePath.mockImplementation((_agent, config) => config);
+
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}/instructions-path`)
+      .send({ path: "subdir/instructions.md", adapterConfigKey: "instructionsFilePath" }));
+
+    expect(res.status).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalled();
   });
 
   it("blocks agent-authenticated hires that set instructions bundle config", async () => {

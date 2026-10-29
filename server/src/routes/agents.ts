@@ -53,7 +53,7 @@ import { selectDashboardRunIds } from "../services/dashboard-run-selection.js";
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { readFile, rm } from "node:fs/promises";
+import { lstat, readFile, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
@@ -110,7 +110,7 @@ import { inheritNativeRunnerAdapterConfig } from "../services/native-runtime/nat
 import { agentInstructionRevisionService } from "../services/agent-instruction-revisions.js";
 import { agentInstructionWorkingCopyService } from "../services/agent-instruction-working-copies.js";
 import { authorizeInstructionRead } from "../services/agent-instruction-authorization.js";
-import { instructionPath } from "../services/agent-instruction-files.js";
+import { assertInstructionPathSafe, instructionPath } from "../services/agent-instruction-files.js";
 import { agentInstructionsBundleMode, deriveBundleState } from "../services/agent-instructions.js";
 import {
   agentService,
@@ -2398,6 +2398,53 @@ export function agentRoutes(
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       throw unprocessable(`Invalid opencode_local adapterConfig: ${reason}`);
+    }
+  }
+
+  /**
+   * Reject symlink escapes for agent-managed instructions paths.
+   * Lexical containment (path.resolve) cannot see through symlinks: an agent
+   * with workspace-write access could point a lexically-contained path through
+   * a symlink at a target outside the managed root, and later instruction
+   * reads follow the link. Fails closed on any symlink in the managed root or
+   * in the resolved components, and verifies the real target of an existing
+   * path stays inside the real managed root. Non-existent tails cannot be
+   * symlinks, so the walk stops at the first missing component (TOCTOU
+   * between check and use is accepted here; instruction consumers resolve
+   * the persisted absolute path).
+   */
+  async function assertAgentInstructionsPathHasNoSymlinkEscape(cwd: string, resolvedCandidate: string) {
+    const symlinkEscapeError = "Path traversal detected: instructions path must not traverse a symlink outside the managed instructions directory";
+    // The managed root itself must be a real directory, not a symlink.
+    const rootStat = await lstat(cwd).catch(() => null);
+    if (rootStat?.isSymbolicLink()) {
+      throw forbidden(symlinkEscapeError);
+    }
+    // Walk each resolved component below the root; reject symlinks. Stop at
+    // the first component that does not exist yet — it cannot be a symlink.
+    const relative = path.relative(cwd, resolvedCandidate);
+    const parts = relative === "" ? [] : relative.split(path.sep);
+    let current = cwd;
+    for (const part of parts) {
+      if (!part || part === ".") continue;
+      current = path.join(current, part);
+      const stat = await lstat(current).catch(() => null);
+      if (!stat) break;
+      if (stat.isSymbolicLink()) {
+        throw forbidden(symlinkEscapeError);
+      }
+    }
+    // If the target already exists, verify its real location stays inside the
+    // real managed root (covers symlinked parent directories above cwd, e.g.
+    // /tmp -> /private/tmp on macOS, and any race the walk above missed).
+    const realTarget = await realpath(resolvedCandidate).catch(() => null);
+    if (realTarget) {
+      const realRoot = await realpath(cwd).catch(() => cwd);
+      if (realTarget !== realRoot && !realTarget.startsWith(realRoot + path.sep)) {
+        throw forbidden(
+          "Path traversal detected: resolved path escapes the managed instructions directory",
+        );
+      }
     }
   }
 
@@ -4984,16 +5031,107 @@ export function agentRoutes(
   });
 
   router.patch("/agents/:id/instructions-path", validate(updateAgentInstructionsPathSchema), async (req, res) => {
-    if (req.actor.type !== "board") {
-      throw forbidden("Only board-authenticated callers can manage instructions path or bundle configuration");
+    if (req.actor.type !== "board" && req.actor.type !== "agent") {
+      throw forbidden("Only board-authenticated callers or the agent itself can manage instructions path or bundle configuration");
     }
 
     const id = req.params.id as string;
+
+    // Agents can only update their own instructions path
+    if (req.actor.type === "agent" && req.actor.agentId !== id) {
+      throw forbidden("Agents can only manage their own instructions path");
+    }
+
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
 
     await assertCanManageInstructionsPath(req, existing);
     assertExternalInstructionsAdmin(req, existing);
+
+    // Agents may only set instructions-path-related adapter config keys and managed paths
+    if (req.actor.type === "agent") {
+      const requestedKey = asNonEmptyString(req.body.adapterConfigKey);
+      const defaultKey = resolveInstructionsPathKey(existing.adapterType);
+      const effectiveKey = requestedKey ?? defaultKey;
+      if (effectiveKey && !KNOWN_INSTRUCTIONS_PATH_KEYS.has(effectiveKey)) {
+        throw forbidden(
+          "Agents can only update instructions-path-related adapter configuration",
+        );
+      }
+      // Reject path traversal — the resolved path must stay within the managed
+      // instructions directory. Validate the literal value that will be
+      // persisted: the schema already trims it, resolveInstructionsFilePath
+      // stores it verbatim, and no downstream consumer URI-decodes it, so
+      // decoding here would both cause false positives (a harmless literal
+      // "%2e%2e" filename) and diverge from what is actually used.
+      if (req.body.path && typeof req.body.path === "string") {
+        const candidatePath: string = req.body.path;
+        if (candidatePath.includes("\0")) {
+          throw forbidden("Agents can only set managed (relative) instructions paths");
+        }
+        // Reject absolute paths (POSIX and Windows) — agents may only use relative managed paths
+        if (path.isAbsolute(candidatePath) || /^[a-zA-Z]:[\\/]/.test(candidatePath)) {
+          throw forbidden(
+            "Agents can only set managed (relative) instructions paths",
+          );
+        }
+        const rawCwd = asNonEmptyString(existing.adapterConfig?.cwd ?? (asRecord(existing.adapterConfig) ?? {}).cwd);
+        // Fail closed: without a usable absolute managed root there is nothing
+        // to contain the path against, so reject instead of skipping validation.
+        if (!rawCwd || !path.isAbsolute(rawCwd)) {
+          throw forbidden(
+            "Agents can only set instructions paths for agents with a managed working directory",
+          );
+        }
+        // Canonicalize cwd: resolve to absolute, normalize, and strip trailing separator
+        const cwd = path.resolve(rawCwd);
+        const resolvedCandidate = path.resolve(cwd, candidatePath);
+        // Check containment: resolved path must be exactly cwd or start with cwd/
+        if (resolvedCandidate !== cwd && !resolvedCandidate.startsWith(cwd + path.sep)) {
+          throw forbidden(
+            "Path traversal detected: resolved path escapes the managed instructions directory",
+          );
+        }
+        // Symlink-aware containment: lexical checks alone cannot see through
+        // symlinks, so an agent with workspace-write access could otherwise
+        // point a lexically-contained path through a symlink at a target
+        // outside the managed root, and later instruction reads follow the
+        // link. Reject symlinks in the managed root and in the resolved
+        // components, then verify the real target stays inside the real root.
+        await assertAgentInstructionsPathHasNoSymlinkEscape(cwd, resolvedCandidate);
+        // Defense in depth against TOCTOU (symlink planted between PATCH and
+        // next read): instruction consumption re-validates with no-follow /
+        // realpath on every read via assertInstructionPathSafe +
+        // readInstructionBytes (O_NOFOLLOW) in
+        // server/src/services/agent-instruction-files.ts, enforced by
+        // getBundle/getBundleLocation/readFile in agent-instructions.ts. A
+        // link planted after this PATCH is rejected at the next read. Run the
+        // same consumption-time validator here so persist-time and use-time
+        // share one no-follow implementation (map 422 → 403 to preserve the
+        // agent self-service contract).
+        try {
+          await assertInstructionPathSafe(cwd, resolvedCandidate.slice(cwd.length + 1).split(path.sep).join("/") || ".");
+        } catch (error) {
+          // assertInstructionPathSafe allows non-existent tails but rejects
+          // symlink components and non-file finals. The directory itself
+          // (candidate === cwd) and existing directory tails are not symlink
+          // escapes — the first-layer walk above already cleared symlinks —
+          // so only non-directory failures become 403s.
+          if (resolvedCandidate === cwd) {
+            void error;
+          } else {
+            const tailStat = await lstat(resolvedCandidate).catch(() => null);
+            if (tailStat?.isDirectory() && !tailStat.isSymbolicLink()) {
+              void error;
+            } else {
+              throw forbidden(
+                "Path traversal detected: instructions path must not traverse a symlink outside the managed instructions directory",
+              );
+            }
+          }
+        }
+      }
+    }
 
     const existingAdapterConfig = asRecord(existing.adapterConfig) ?? {};
     const explicitKey = asNonEmptyString(req.body.adapterConfigKey);
