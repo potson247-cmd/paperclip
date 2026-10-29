@@ -45,6 +45,7 @@ import {
   prepareClaudeConfigSeed,
   prepareSandboxClaudeProbeRuntime,
 } from "./claude-config.js";
+import { prepareManagedClaudeAcpConfig } from "./managed-acp-config.js";
 import {
   buildAdapterTestTargetCheck,
   buildClaudeLoginRequiredHint,
@@ -313,6 +314,10 @@ async function prepareClaudeRemoteManagedHome(
   });
   // Repoint CLAUDE_CONFIG_DIR onto the in-sandbox config dir.
   env.CLAUDE_CONFIG_DIR = remoteClaudeConfigDir;
+  if (input.config.managedAiConnection) {
+    env.CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL = "1";
+    env.CLAUDE_CODE_PLUGIN_CACHE_DIR = path.posix.join(remoteClaudeConfigDir, "plugins");
+  }
   return { stagedRuntime, teardown: registerWorkspaceSyncBack(stagedRuntime) };
 }
 
@@ -401,10 +406,20 @@ export function createClaudeAcpExecutor(options: ClaudeAcpExecutorOptions = {}):
       executionTarget: ctx.executionTarget,
       legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
     });
-    const result = await currentExecutor({
-      ...ctx,
-      config: buildClaudeAcpConfig(ctx.config, target?.kind === "remote" ? {} : process.env),
-    });
+    const acpConfig = buildClaudeAcpConfig(ctx.config, target?.kind === "remote" ? {} : process.env);
+    if (acpConfig.managedAiConnection && target?.kind !== "remote") {
+      const managedConfig = await prepareManagedClaudeAcpConfig({
+        configEnv: acpConfig.env,
+        managedAiHomeOverrides: acpConfig.managedAiHomeOverrides,
+        processEnv: process.env,
+        companyId: ctx.agent.companyId,
+        agentId: ctx.agent.id,
+        runId: ctx.runId,
+      });
+      acpConfig.env = managedConfig.env;
+      if (managedConfig.importMessage) await ctx.onLog("stdout", managedConfig.importMessage);
+    }
+    const result = await currentExecutor({ ...ctx, config: acpConfig });
     return mapClaudeAcpAuthErrorCode(result);
   };
 }
