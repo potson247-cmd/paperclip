@@ -23,6 +23,49 @@ import { WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE } from "@paperclipai/adapter-utils/
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
 import { decideGrokAuthMerge } from "@paperclipai/adapter-grok-local/server";
+import { logger } from "../middleware/logger.js";
+import type { createDeliveryWorkCoordinator } from "./delivery-work-coordinator.js";
+import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
+
+const pendingManagedHomeRemovals = new Set<string>();
+let wakeManagedHomeRemovalWork: (() => void) | undefined;
+
+async function retryPendingManagedHomeRemovals() {
+  const failures: unknown[] = [];
+  for (const homeDir of pendingManagedHomeRemovals) {
+    try {
+      await rm(homeDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      pendingManagedHomeRemovals.delete(homeDir);
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length) throw new AggregateError(failures, "Temporary managed AI home cleanup failed");
+}
+
+export function registerManagedAiHomeCleanupWork(
+  coordinator: ReturnType<typeof createDeliveryWorkCoordinator>,
+) {
+  const worker = coordinator.register(DELIVERY_QUEUES.managedAiHomeCleanup, {
+    retryMs: 30_000,
+    runDuringDrain: true,
+    run: retryPendingManagedHomeRemovals,
+    hasPending: async () => pendingManagedHomeRemovals.size > 0,
+  });
+  wakeManagedHomeRemovalWork = worker.wake;
+  return worker;
+}
+
+async function safeRemoveManagedHome(homeDir: string) {
+  try {
+    await rm(homeDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    pendingManagedHomeRemovals.delete(homeDir);
+  } catch (error) {
+    pendingManagedHomeRemovals.add(homeDir);
+    logger.warn({ dir: homeDir, err: error }, "Failed to remove temporary managed AI home directory; cleanup remains queued");
+    wakeManagedHomeRemovalWork?.();
+  }
+}
 
 export function isAiConnectionBusy(error: unknown): error is HttpError {
   return error instanceof HttpError && error.status === 422 &&
@@ -492,11 +535,11 @@ export async function prepareManagedAiRuntime(
         // exhausted lock retry or database failure. The caller can retry the
         // same cleanup; only a committed save or an intentional discard
         // (revoked grant, older/different identity) permits deletion.
-        if (home) await rm(home, { recursive: true, force: true });
+        if (home) await safeRemoveManagedHome(home);
       },
     };
   } catch (error) {
-    if (home) await rm(home, { recursive: true, force: true });
+    if (home) await safeRemoveManagedHome(home);
     throw error;
   }
 }
