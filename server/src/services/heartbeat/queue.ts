@@ -77,6 +77,7 @@ import {
   gt,
   gte,
   inArray,
+  isNotNull,
   isNull,
   lt,
   lte,
@@ -170,6 +171,7 @@ import {
 import { isHeartbeatWakeOnDemandEnabled, supportsUnscopedTimerHeartbeat } from "../heartbeat-policy.js";
 import { isUuidLike } from "@paperclipai/shared";
 import { retryChatControlAdmission } from "../chat-control-admission-retry.js";
+import { isIssueCommentWakeIdempotencyKey } from "../issue-comment-wakeup.js";
 
 import type { HeartbeatServiceOptions } from "../heartbeat.js";
 import type { createHeartbeatRunState } from "./run-state.js";
@@ -2253,6 +2255,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       triggerDetail,
       payload,
     });
+    const durableIssueCommentWake = isIssueCommentWakeIdempotencyKey({
+      idempotencyKey: opts.idempotencyKey,
+      commentId: wakeCommentId,
+      agentId,
+    });
     // Keep each request's own server-derived origin, including coalesced wakes.
     // A run's merged context cannot establish which caller authored one receipt.
     // Overwrite caller-supplied nested context rather than trusting it.
@@ -2790,7 +2797,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       await writeSkippedRequest("budget.blocked", { error: budgetBlock.reason }, {
         scopeType: budgetBlock.scopeType, scopeId: budgetBlock.scopeId,
       });
-      if (caseRequest) return null;
+      if (caseRequest || durableIssueCommentWake) return null;
       throw conflict(budgetBlock.reason, {
         scopeType: budgetBlock.scopeType,
         scopeId: budgetBlock.scopeId,
@@ -2806,6 +2813,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           error: invokability.message,
         }, { status: agent.status, reason: invokability.reason });
       }
+      if (durableIssueCommentWake) return null;
       throw conflict(invokability.message, {
         status: agent.status,
         reason: invokability.reason,
@@ -2908,6 +2916,46 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
+
+          if (durableIssueCommentWake) {
+            const [existingWake] = await tx
+              .select()
+              .from(agentWakeupRequests)
+              .where(
+                and(
+                  eq(agentWakeupRequests.companyId, agent.companyId),
+                  sql`${agentWakeupRequests.idempotencyKey} = ${`issue-comment:${wakeCommentId}:`} || ${agentWakeupRequests.agentId}::text`,
+                  sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+                  or(
+                    isNotNull(agentWakeupRequests.runId),
+                    notInArray(agentWakeupRequests.status, [
+                      "skipped",
+                      "failed",
+                      "cancelled",
+                    ]),
+                  ),
+                ),
+              )
+              .orderBy(asc(agentWakeupRequests.requestedAt))
+              .limit(1);
+            if (existingWake?.runId && existingWake.agentId === agentId) {
+              const [existingRun] = await tx
+                .select()
+                .from(heartbeatRuns)
+                .where(
+                  and(
+                    eq(heartbeatRuns.companyId, agent.companyId),
+                    eq(heartbeatRuns.agentId, agentId),
+                    eq(heartbeatRuns.id, existingWake.runId),
+                  ),
+                )
+                .limit(1);
+              if (existingRun)
+                return { kind: "replayed" as const, run: existingRun };
+            }
+            if (existingWake)
+              return { kind: "durable" as const, receipt: existingWake };
+          }
 
           if (executionWaitRequestId) {
             const [pending] = await tx.select().from(agentWakeupRequests).where(and(
@@ -3144,6 +3192,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               )
               .limit(1);
             if (held) {
+              if (durableIssueCommentWake)
+                return { kind: "skipped" as const };
               throw conflict(
                 "This task has external chat input that has not been admitted. Check the connection's Activity; let pending input finish, or restore access and send a new authorized message before starting the task.",
                 { code: "chat_inbound_wakeup_unadmitted", issueId },
