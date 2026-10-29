@@ -4207,6 +4207,9 @@ export function agentRoutes(
     if (!rollbackConfig) {
       throw unprocessable("Invalid revision snapshot");
     }
+    if (typeof rollbackConfig.budgetMonthlyCents === "number" && rollbackConfig.budgetMonthlyCents !== existing.budgetMonthlyCents) {
+      assertBoard(req);
+    }
     assertProviderTraceSettingTransition(
       req,
       rollbackConfig.runtimeConfig,
@@ -4339,6 +4342,17 @@ export function agentRoutes(
   const handleAgentHire = async (req: Request, res: Response) => {
     const companyId = req.params.companyId as string;
     await assertCanCreateAgentsForCompany(req, companyId);
+    const company = await db
+      .select()
+      .from(companies)
+      .where(eq(companies.id, companyId))
+      .then((rows) => rows[0] ?? null);
+    if (!company) {
+      res.status(404).json({ error: "Company not found" });
+      return;
+    }
+
+    if (!company.requireBoardApprovalForNewAgents && req.body.budgetMonthlyCents > 0) assertBoard(req);
     const sourceIssueIds = parseSourceIssueIds(req.body);
     const {
       desiredSkills: requestedDesiredSkills,
@@ -4502,16 +4516,6 @@ export function agentRoutes(
       allowedSandboxProviders: allowedSandboxProvidersForAgent(hireInput.adapterType),
     });
 
-    const company = await db
-      .select()
-      .from(companies)
-      .where(eq(companies.id, companyId))
-      .then((rows) => rows[0] ?? null);
-    if (!company) {
-      res.status(404).json({ error: "Company not found" });
-      return;
-    }
-
     // Idempotency within a run: if this run already created a hire from this
     // exact request, return that hire instead of creating a duplicate. The
     // creating agent cannot pause or delete its own hire (board-only), so a
@@ -4563,6 +4567,7 @@ export function agentRoutes(
         {
           ...(setupAgentId ? { setupAgentId } : {}),
           createdByUserId: req.actor.type === "board" ? req.actor.userId : null,
+          ...(req.actor.type === "board" && req.body.budgetMonthlyCents > 0 ? { initialBudgetPolicyUserId: getActorInfo(req).actorId } : {}),
           runnerResolved: true,
           responsibleUserId: responsibleUserForAiRequest(req),
           aiConnectionInstall: managedHireConnection ? { ...managedHireConnection, createdByUserId: responsibleUserForAiRequest(req) } : undefined,
@@ -4598,6 +4603,7 @@ export function agentRoutes(
 
       let approval: Awaited<ReturnType<typeof approvalsSvc.getById>> | null = null;
       const actor = getActorInfo(req);
+
 
       if (requiresApproval) {
         const requestedAdapterType = normalizedHireInput.adapterType ?? agent.adapterType;
@@ -4723,6 +4729,7 @@ export function agentRoutes(
   router.post("/companies/:companyId/agents", validate(createAgentSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     await assertCanCreateAgentsForCompany(req, companyId);
+    if (req.body.budgetMonthlyCents > 0) assertBoard(req);
 
     const company = await db
       .select()
@@ -4844,6 +4851,7 @@ export function agentRoutes(
       {
         ...(setupId ? { setupOnly: true } : {}),
         createdByUserId: req.actor.type === "board" ? req.actor.userId : null,
+        ...(req.actor.type === "board" && req.body.budgetMonthlyCents > 0 ? { initialBudgetPolicyUserId: getActorInfo(req).actorId } : {}),
         runnerResolved: true,
         responsibleUserId: responsibleUserForAiRequest(req),
         aiConnectionInstall: managedConnection ? { ...managedConnection, createdByUserId: responsibleUserForAiRequest(req) } : undefined,
@@ -4906,18 +4914,7 @@ export function agentRoutes(
     );
     await builtInAgentService(db).ensureCompanyDefaultAgentGrants(companyId);
 
-    if (agent.budgetMonthlyCents > 0) {
-      await budgets.upsertPolicy(
-        companyId,
-        {
-          scopeType: "agent",
-          scopeId: agent.id,
-          amount: agent.budgetMonthlyCents,
-          windowKind: "calendar_month_utc",
-        },
-        actor.actorType === "user" ? actor.actorId : null,
-      );
-    }
+
 
     res.status(201).json({ ...redactAgentRowForResponse(agent), ...(configurationWarnings.length ? { configurationWarnings } : {}) });
   });
@@ -5391,6 +5388,7 @@ export function agentRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
+    if (hasOwn(req.body as object, "budgetMonthlyCents") && req.body.budgetMonthlyCents !== existing.budgetMonthlyCents) assertBoard(req);
 
     if (hasOwn(req.body as object, "permissions")) {
       res.status(422).json({ error: "Use /api/agents/:id/permissions for permission changes" });
