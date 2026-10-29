@@ -48,6 +48,7 @@ import {
   issueThreadInteractions,
   issueThreadInteractionIdempotencyKeys,
   issues,
+  labels,
   toolActionRequests,
   toolOauthStates,
 } from "@paperclipai/db";
@@ -159,6 +160,7 @@ type InteractionActor = {
   identityContextId?: string | null;
   agentId?: string | null;
   runId?: string | null;
+  agentApiKeyId?: string | null;
   userId?: string | null;
   systemId?: string | null;
   resolverPolicyRestriction?:
@@ -4200,6 +4202,7 @@ export function issueThreadInteractionService(
         SuggestTasksResultCreatedTask
       >();
       const createdWakeTargets: IssueWakeTarget[] = [];
+      const postCommitActivityPublications: ActivityPublication[] = [];
 
       await db.transaction(async (tx) => {
         await notifyChatConfirmationResolution(tx, current);
@@ -4243,6 +4246,25 @@ export function issueThreadInteractionService(
           throw interactionAlreadyResolvedError();
         }
 
+        const labelNames = [
+          ...new Set(orderedTasks.flatMap((task) => task.labels ?? [])),
+        ];
+        const labelIdByName = new Map(
+          labelNames.length === 0
+            ? []
+            : (
+                await tx
+                  .select({ id: labels.id, name: labels.name })
+                  .from(labels)
+                  .where(
+                    and(
+                      eq(labels.companyId, issue.companyId),
+                      inArray(labels.name, labelNames),
+                    ),
+                  )
+              ).map((row) => [row.name, row.id] as const),
+        );
+
         for (const task of orderedTasks) {
           const proposedParentId = task.parentClientKey
             ? (createdByClientKey.get(task.parentClientKey)?.issueId ?? null)
@@ -4268,6 +4290,9 @@ export function issueThreadInteractionService(
             projectId: task.projectId ?? issue.projectId,
             goalId: task.goalId ?? issue.goalId,
             billingCode: task.billingCode ?? null,
+            labelIds: (task.labels ?? []).flatMap(
+              (name) => labelIdByName.get(name) ?? [],
+            ),
             createdByAgentId: actor.agentId ?? null,
             createdByUserId: actor.userId ?? null,
             originIdentityContextId: interaction.sourceIdentityContextId ?? null,
@@ -4301,6 +4326,33 @@ export function issueThreadInteractionService(
             assigneeAgentId: createdIssue.assigneeAgentId ?? null,
             status: createdIssue.status,
           });
+          await logActivity(
+            tx as unknown as Db,
+            {
+              companyId: issue.companyId,
+              actorType: actor.userId
+                ? "user"
+                : actor.agentId
+                  ? "agent"
+                  : "system",
+              actorId:
+                actor.userId ?? actor.agentId ?? actor.systemId ?? "system",
+              agentId: actor.agentId ?? null,
+              runId: actor.runId ?? null,
+              agentApiKeyId: actor.agentApiKeyId ?? null,
+              action: "issue.created",
+              entityType: "issue",
+              entityId: createdIssue.id,
+              details: {
+                title: createdIssue.title,
+                identifier: createdIssue.identifier,
+                parentId: parentIssueId,
+                source: "suggest_tasks_accept",
+                interactionId,
+              },
+            },
+            postCommitActivityPublications,
+          );
         }
 
         const [updated] = await tx
@@ -4327,6 +4379,9 @@ export function issueThreadInteractionService(
         current.updatedAt = updated.updatedAt;
       });
 
+      for (const publication of postCommitActivityPublications) {
+        publishActivity(publication);
+      }
       const accepted = hydrateInteraction(current);
       await emitInteractionResolvedTelemetry(db, accepted, {
         createdTaskCount: createdWakeTargets.length,
