@@ -21,6 +21,11 @@ import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./
 import { conversationNativeDecision, isConversation } from "../agent-conversations.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { randomUUID } from "node:crypto";
+import { RESPONSIBLE_USER_DENIAL_CODES } from "@paperclipai/shared";
+import {
+  getRememberedResponsibleUserDenialForRun,
+  normalizeResponsibleUserDenialCode,
+} from "../responsible-user-denial-run-outcomes.js";
 import { preserveNativeWorkspaceExportLease } from "./native-workspace-export-resume.js";
 import { and, desc, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -602,9 +607,13 @@ function recoveredExecutionFailureMetadata() {
     )) else '{}'::jsonb end`;
 }
 
+/** True when the current run row records a responsible-user denial. */
+const responsibleUserDenialRecorded = () => sql<boolean>`coalesce(${heartbeatRuns.errorCode} in (${sql.join(
+  RESPONSIBLE_USER_DENIAL_CODES.map((code) => sql`${code}`), sql`, `)}), false)`;
+
 async function projectCommittedRun(input: {
   db: Db;
-  run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "status" | "finishedAt" | "runtimeMode" | "nativePhase">;
+  run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "status" | "errorCode" | "finishedAt" | "runtimeMode" | "nativePhase">;
   coordinator: typeof nativeRunFinalizations.$inferSelect;
 }) {
   if (!input.coordinator.resultId) return;
@@ -626,9 +635,15 @@ async function projectCommittedRun(input: {
   if (!["succeeded", "failed", "cancelled"].includes(String(terminalState))) {
     throw new Error("native_finalization_invalid");
   }
-  const projectedStatus = projectNativeTerminalRunStatus(
+  // A responsible-user denial recorded during the run fails it closed. A later
+  // successful native result must not turn it back into a success or clear the
+  // denial code that recovery reads to stop retries.
+  const deniedSuccess = terminalState === "succeeded" &&
+    normalizeResponsibleUserDenialCode(input.run.errorCode) !== null;
+  const projectedStatus = deniedSuccess ? "failed" : projectNativeTerminalRunStatus(
     terminalState as "succeeded" | "failed" | "cancelled",
   );
+  const clearsFailure = terminalState === "succeeded" && !deniedSuccess;
   const needsRepair = and(
     eq(heartbeatRuns.id, input.run.id),
     eq(heartbeatRuns.runtimeMode, "native"),
@@ -660,10 +675,13 @@ async function projectCommittedRun(input: {
       sql`${heartbeatRuns.resultJson}->>'nextAttemptAt' is not null`,
       sql`${heartbeatRuns.resultJson}->>'failureCode' is not null`,
       sql`${heartbeatRuns.resultJson}->>'originalFailureCode' is not null`,
-      ...(terminalState === "succeeded"
+      ...(clearsFailure
         ? [isNotNull(heartbeatRuns.error), isNotNull(heartbeatRuns.errorCode)]
         : []),
     ),
+    // The run row read above can predate a denial written by a concurrent
+    // request. Never clear a denial that is already on the current row.
+    ...(clearsFailure ? [sql`not ${responsibleUserDenialRecorded()}`] : []),
     nativeRunnerOwnershipNotHeldCondition(),
   );
   const [candidate] = await input.db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(needsRepair).limit(1);
@@ -684,7 +702,7 @@ async function projectCommittedRun(input: {
         finishedAt: input.run.finishedAt ?? now,
         nativePhase: "committed",
         nativePhaseUpdatedAt: now,
-        ...(terminalState === "succeeded"
+        ...(clearsFailure
           ? {
               error: null,
               errorCode: null,
@@ -1274,10 +1292,21 @@ export async function finalizeNativeRun(input: {
   const envelope = record(resultRow.resultJson);
   const result = record(envelope.result);
   const terminal = record(envelope.terminal);
-  const terminalState = terminal.runTerminalState;
-  if (!["succeeded", "failed", "cancelled"].includes(String(terminalState))) {
+  const reportedTerminalState = terminal.runTerminalState;
+  if (!["succeeded", "failed", "cancelled"].includes(String(reportedTerminalState))) {
     throw new Error("native_finalization_invalid");
   }
+  // A responsible-user denial recorded during the run fails it closed before
+  // any status or continuation effect is planned: a successful result must not
+  // schedule another wake under the same unresolved responsible user. The
+  // in-process signal covers a denial whose durable marker writes both failed.
+  const responsibleUserDenied = normalizeResponsibleUserDenialCode(
+    await input.db.select({ errorCode: heartbeatRuns.errorCode }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, run.id)).then((rows) => rows[0]?.errorCode),
+  ) !== null || getRememberedResponsibleUserDenialForRun(run) !== null;
+  const terminalState = responsibleUserDenied && reportedTerminalState === "succeeded"
+    ? "failed"
+    : reportedTerminalState;
 
   await input.db
     .update(nativeRunFinalizations)
@@ -1455,6 +1484,7 @@ export async function finalizeNativeRun(input: {
       providerModelRejected: providerFailure?.errorCode === "native_provider_model_rejected" && ownsProviderFailureDecision,
       providerOverloaded: providerFailure?.errorCode === "native_provider_overloaded" && ownsProviderFailureDecision,
       providerFailureSuperseded: providerFailure?.errorCode === "native_provider_overloaded" && !ownsProviderFailureDecision,
+      responsibleUserDenied,
       failureRetryCount: executionFailureRetryCount(run),
       ...(reviewContext ? { nativeReviewOutcome: nativeReview
         ? nativeReview.interaction.status === "pending" ? "pending" as const : "resolved" as const
@@ -1613,7 +1643,10 @@ export async function finalizeNativeRun(input: {
       const alreadyEmittedByCommittedDecision = decision.effects.some(
         (effect) => effect.kind === "cancel_continuations",
       );
-      const clearExecutionFailure = input.projectRunStatus && finalizationPhase === "committed" && terminalState === "succeeded";
+      // A responsible-user denial fails the run closed even when the provider
+      // later submits a successful result; keep its code for recovery.
+      const clearExecutionFailure = input.projectRunStatus && finalizationPhase === "committed" && terminalState === "succeeded"
+        && normalizeResponsibleUserDenialCode(run.errorCode) === null;
       const finalizationMetadata = {
         ...(providerFailure ? { nativeProviderFailure: providerFailure.diagnostic } : {}),
         ...(turnFailure ? { nativeTurnFailure: turnFailure } : {}),
@@ -1649,15 +1682,22 @@ export async function finalizeNativeRun(input: {
         statusVersionAfter: Number(committed.issue.statusVersion),
         workspaceFinalizeStatus: input.workspaceFinalizeStatus,
       };
-      const projectedStatus = terminalState === "succeeded" ? "succeeded" as const
+      // The run row read above can predate a denial written by a concurrent
+      // request; decide on the current row so a denial is never cleared.
+      const projectedStatus = terminalState === "succeeded"
+        ? sql`case when ${responsibleUserDenialRecorded()} then 'failed' else 'succeeded' end`
         : terminalState === "cancelled" ? "cancelled" as const : "failed" as const;
       const projectedResult = sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb)
         || ${JSON.stringify(finalizationMetadata)}::jsonb
         || ${clearExecutionFailure ? recoveredExecutionFailureMetadata() : sql`'{}'::jsonb`}`;
       const projectedError = providerFailure ? sql`coalesce(${heartbeatRuns.error}, ${providerFailure.errorMessage})`
-        : clearExecutionFailure ? sql`null` : heartbeatRuns.error;
+        : clearExecutionFailure
+          ? sql`case when ${responsibleUserDenialRecorded()} then ${heartbeatRuns.error} else null end`
+          : heartbeatRuns.error;
       const projectedErrorCode = providerFailure ? sql`coalesce(${heartbeatRuns.errorCode}, ${providerFailure.errorCode})`
-        : clearExecutionFailure ? sql`null` : heartbeatRuns.errorCode;
+        : clearExecutionFailure
+          ? sql`case when ${responsibleUserDenialRecorded()} then ${heartbeatRuns.errorCode} else null end`
+          : heartbeatRuns.errorCode;
       const projectionChanged = or(
         sql`${heartbeatRuns.nativePhase} is distinct from ${finalizationPhase}`,
         sql`${heartbeatRuns.resultJson} is distinct from ${projectedResult}`,
@@ -1682,7 +1722,7 @@ export async function finalizeNativeRun(input: {
             : {}),
           nativePhase: finalizationPhase,
           nativePhaseUpdatedAt: now,
-          ...(clearExecutionFailure ? { error: null, errorCode: null } : {}),
+          ...(clearExecutionFailure ? { error: projectedError, errorCode: projectedErrorCode } : {}),
           ...(providerFailure ? { error: projectedError, errorCode: projectedErrorCode } : {}),
           resultJson: projectedResult,
           updatedAt: now,
