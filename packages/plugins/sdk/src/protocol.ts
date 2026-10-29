@@ -381,6 +381,7 @@ export interface ConfigChangedParams {
 export interface ValidateConfigParams {
   /** The configuration to validate. */
   config: Record<string, unknown>;
+  companyId?: string | null;
 }
 
 /**
