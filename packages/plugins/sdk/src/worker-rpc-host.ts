@@ -353,6 +353,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
   let configCompanyId: string | null = null;
   let databaseNamespace: string | null = null;
   const invocationContextStorage = new AsyncLocalStorage<PluginInvocationContext>();
+  const finishedInvocations = new WeakSet<PluginInvocationContext>();
 
   // Plugin handler registrations (populated during setup())
   const eventHandlers: EventRegistration[] = [];
@@ -387,6 +388,22 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
     if (!running) return;
     const serialized = serializeMessage(message as any);
     stdoutStream.write(serialized);
+  }
+
+  function liveInvocation(): PluginInvocationContext | undefined {
+    const invocation = invocationContextStorage.getStore();
+    return invocation && !finishedInvocations.has(invocation) ? invocation : undefined;
+  }
+
+  async function runInInvocationScope<T>(
+    invocation: PluginInvocationContext,
+    fn: () => T | Promise<T>,
+  ): Promise<T> {
+    try {
+      return await invocationContextStorage.run(invocation, fn);
+    } finally {
+      finishedInvocations.add(invocation);
+    }
   }
 
   /**
@@ -445,7 +462,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       });
 
       try {
-        const activeInvocation = invocationContextStorage.getStore();
+        const activeInvocation = liveInvocation();
         const request = {
           ...createRequest(method, params, id),
           ...(activeInvocation ? { paperclipInvocationId: activeInvocation.id } : {}),
@@ -464,7 +481,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
    */
   function notifyHost(method: string, params: unknown): void {
     try {
-      const activeInvocation = invocationContextStorage.getStore();
+      const activeInvocation = liveInvocation();
       sendMessage({
         ...createNotification(method, params),
         ...(activeInvocation ? { paperclipInvocationId: activeInvocation.id } : {}),
@@ -1604,7 +1621,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       }
       const invoke = () => dispatchMethod(method, params);
       const result = request.paperclipInvocation
-        ? await invocationContextStorage.run(request.paperclipInvocation, invoke)
+        ? await runInInvocationScope(request.paperclipInvocation, invoke)
         : await invoke();
       sendMessage(createSuccessResponse(id, result ?? null));
     } catch (err) {
@@ -2372,7 +2389,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       const runNotification = async (fn: () => void | Promise<void>) => {
         const done = idleDrain.begin();
         try {
-          await (notif.paperclipInvocation ? invocationContextStorage.run(notif.paperclipInvocation, fn) : fn());
+          await (notif.paperclipInvocation ? runInInvocationScope(notif.paperclipInvocation, fn) : fn());
         } finally { done(); }
       };
       if (notif.method === "releaseIdleSleep" && notif.params) {
