@@ -8,6 +8,7 @@ import { idleWorkSnapshot } from "../services/task-admission.js";
 import { readIdleSleepSafety } from "../services/idle-sleep-safety.js";
 import * as idleLocalWork from "../services/idle-local-work.js";
 import { idleBackupWakeMarker, markIdleBackupWakeRequired } from "../services/idle-database-backup.js";
+import { DEFAULT_FIRST_BACKUP_MIN_DELAY_MS } from "../services/database-backup-schedule.js";
 import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
 import { decisionService, decisionRetentionService, toolAccessService, reconcileBuiltInAgentsOnStartup, reconcileCodexLocalManagedHomesOnStartup, reconcilePersistedRuntimeServicesOnStartup } from "../services/index.js";
 
@@ -642,11 +643,19 @@ describe("startServer feedback export wiring", () => {
     process.env.PAPERCLIP_DB_BACKUP_IDLE_CHECKPOINT_ENABLED = checkpointMode ? "1" : "0";
     loadConfigMock.mockReturnValue(buildTestConfig({ databaseBackupEnabled: true, databaseBackupDir: directory }));
     const eligible = vi.spyOn(idleLocalWork, "markIdleStartupComplete");
+    // No timestamped dump exists in the fixture dir, so the first scheduled run
+    // is the overdue catch-up after DEFAULT_FIRST_BACKUP_MIN_DELAY_MS.
     let retry: (() => void) | undefined;
-    const timers = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void, ms: number) => {
-      if (ms === 60 * 60 * 1000) retry = callback;
-      return 1 as unknown as ReturnType<typeof setInterval>;
-    }) as typeof setInterval);
+    const realSetTimeout = globalThis.setTimeout;
+    const firstRunTimer = vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, ms?: number, ...args: unknown[]) => {
+      if (ms === DEFAULT_FIRST_BACKUP_MIN_DELAY_MS) {
+        retry = callback;
+        return 1 as unknown as ReturnType<typeof setTimeout>;
+      }
+      return realSetTimeout(callback, ms, ...args);
+    }) as typeof setTimeout);
+    const timers = vi.spyOn(globalThis, "setInterval").mockImplementation((() =>
+      1 as unknown as ReturnType<typeof setInterval>) as typeof setInterval);
     let finish!: () => void;
     const pending = new Promise<void>(resolve => { finish = resolve; });
     const writeBackup = async (options: Parameters<typeof runDatabaseBackup>[0]) => {
@@ -676,10 +685,13 @@ describe("startServer feedback export wiring", () => {
       const options = createAppMock.mock.calls[0]?.[1] as unknown as { prepareIdleDatabaseBackup?: unknown };
       expect(Boolean(options.prepareIdleDatabaseBackup)).toBe(checkpointMode);
       expect(existsSync(idleBackupWakeMarker(directory))).toBe(fails);
+      // The first run is scheduled after an asynchronous directory scan. Wait
+      // for it in every case so it cannot land in the next test's timer spy.
+      await vi.waitFor(() => expect(retry).toEqual(expect.any(Function)));
       if (fails) {
         vi.mocked(runDatabaseBackup).mockImplementationOnce(writeBackup);
-        expect(retry).toEqual(expect.any(Function));
         const activeBeforeRetry = idleWorkSnapshot().active;
+        const intervalsBeforeRetry = timers.mock.calls.length;
         retry!();
         await vi.waitFor(() => {
           expect(existsSync(idleBackupWakeMarker(directory))).toBe(false);
@@ -687,11 +699,13 @@ describe("startServer feedback export wiring", () => {
           expect(idleWorkSnapshot().active).toBe(activeBeforeRetry);
         });
         expect(runDatabaseBackup).toHaveBeenCalledTimes(2);
+        // The first run hands off to the regular interval.
+        expect(timers.mock.calls.slice(intervalsBeforeRetry)).toEqual([[expect.any(Function), 60 * 60 * 1000]]);
       }
     } finally {
       finish();
       await starting;
-      timers.mockRestore(); eligible.mockRestore();
+      timers.mockRestore(); firstRunTimer.mockRestore(); eligible.mockRestore();
       if (previousFlag === undefined) delete process.env.PAPERCLIP_DB_BACKUP_IDLE_CHECKPOINT_ENABLED;
       else process.env.PAPERCLIP_DB_BACKUP_IDLE_CHECKPOINT_ENABLED = previousFlag;
       rmSync(directory, { recursive: true, force: true });
