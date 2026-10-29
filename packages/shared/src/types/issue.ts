@@ -1398,6 +1398,9 @@ export interface RequestConfirmationCustomTarget {
   revisionNumber?: number | null;
   label?: string | null;
   href?: string | null;
+  proposedValues?: Record<string, unknown> | null;
+  valueDigest?: string | null;
+  digestVersion?: number | null;
 }
 
 /** An uploaded artifact's immutable bytes, independent of its display name. */
