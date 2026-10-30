@@ -3080,6 +3080,36 @@ export async function reconcileRetainedNativeSessionCleanup(
   return outcome;
 }
 
+/** One exact, operator-requested cleanup-only reconciliation; it never retries the task turn. */
+export async function retryNativeSessionCleanupForRun(
+  db: Db,
+  input: { companyId: string; issueId: string; runId: string },
+): Promise<NativeCleanupOutcome> {
+  const [run] = await db.select({
+    id: heartbeatRuns.id,
+    companyId: heartbeatRuns.companyId,
+    issueId: heartbeatRuns.nativeIssueId,
+    agentId: heartbeatRuns.agentId,
+    sessionId: heartbeatRuns.nativeSessionId,
+    runnerInstanceId: heartbeatRuns.runnerInstanceId,
+    runtimeMode: heartbeatRuns.runtimeMode,
+    status: heartbeatRuns.status,
+    finishedAt: heartbeatRuns.finishedAt,
+  }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.id, input.runId),
+    eq(heartbeatRuns.companyId, input.companyId),
+    eq(heartbeatRuns.nativeIssueId, input.issueId),
+  )).limit(1);
+  if (!run || run.runtimeMode !== "native" || run.status !== "failed" ||
+      !run.finishedAt || !run.sessionId || !run.runnerInstanceId) {
+    return { status: "not_eligible", runId: input.runId };
+  }
+  return reconcileRetainedNativeSessionCleanup(db, {
+    companyId: run.companyId,
+    runId: run.id,
+  });
+}
+
 async function inspectRetainedNativeSessionCleanup(
   db: Db,
   input: { companyId: string; runId: string },
