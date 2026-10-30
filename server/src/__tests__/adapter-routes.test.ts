@@ -487,9 +487,11 @@ describe("adapter routes", () => {
       default: "claude",
       meta: { visibleWhen: { key: "provider", value: "acpx" } },
       options: [
-        { value: "claude", label: "Claude" },
         { value: "grok", label: "Grok Build" },
+        { value: "claude", label: "Claude" },
+        { value: "cursor", label: "Cursor" },
         { value: "copilot", label: "GitHub Copilot" },
+        { value: "pi", label: "Pi" },
       ],
     });
     expect(JSON.stringify(res.body)).not.toContain("Codex via ACPX");

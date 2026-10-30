@@ -36,6 +36,10 @@ function makeValues(overrides: Partial<CreateConfigValues> = {}): CreateConfigVa
 }
 
 describe("buildCodexLocalConfig", () => {
+  it("rejects pending Kimi Code instead of saving another ACP profile", () => {
+    expect(() => buildPaperclipRunnerConfig(makeValues({ model: "explicit-kimi-model", adapterSchemaValues: { provider: "acpx", acpxAgent: "kimi" } })))
+      .toThrow("Kimi Code is not enabled for production");
+  });
   it("refuses pending Antigravity selection before saving Runner config", () => {
     expect(() => buildPaperclipRunnerConfig(makeValues({ model: "exact-antigravity-model",
       adapterSchemaValues: { provider: "acpx", acpxAgent: "antigravity" } })))

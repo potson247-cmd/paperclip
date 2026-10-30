@@ -990,6 +990,13 @@ The account needs Kimi Code entitlement. Runtime Test verifies installation and
 queries the authenticated Code model catalog for the exact selected model. It
 sends no model prompt; an actual task verifies inference and tool execution.
 
+The pending native profile requires a trusted operator startup record for its exact
+company, model, platform closure and expiry. Runtime startup binds that record
+to the actual run/session; metadata Test uses a separate probe operation/session.
+The manual fixture stages authority through its owned server restart after
+company creation. Saved agent configuration and public requests cannot grant it.
+The qualified native profile requires no candidate grant.
+
 The ordinary hiring path stays hidden while qualification is pending. Existing
 legacy Kimi agents retain their runtime and history. Managed Kimi connections,
 ambient login borrowing, other regions/platforms, steering, native child work,

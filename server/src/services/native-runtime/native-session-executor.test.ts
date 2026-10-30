@@ -47,6 +47,7 @@ import {
 import {
   canonicalNativeRuntimeContextDigest,
   CURSOR_DISTRIBUTION_PINS,
+  KIMI_DISTRIBUTION_CLOSURE_SHA256,
   QUALIFIED_ACPX_PROFILES,
   acpxRuntimeSessionDirectoryName,
   resolveAcpxRuntimeRoot,
@@ -1962,6 +1963,76 @@ describe("remote provider pack manifest", () => {
     await writeFile(join(root, cursorPath, "runtime"), "substitute Cursor runtime");
     expect(() => readRemoteProviderPackManifest(root)).toThrow("asset tree digest mismatch");
     await writeFile(join(root, cursorPath, "runtime"), "pinned Cursor runtime");
+    const kimiPath = "provider-assets/kimi/linux-x64";
+    await mkdir(join(root, kimiPath), { recursive: true });
+    await writeFile(join(root, kimiPath, "runtime"), "pinned Kimi runtime");
+    const kimi = { version: QUALIFIED_ACPX_PROFILES.kimi.agentServerVersion,
+      profileDigest: QUALIFIED_ACPX_PROFILES.kimi.commandDigest,
+      closureDigest: `sha256:${KIMI_DISTRIBUTION_CLOSURE_SHA256["linux-x64"]}`,
+      qualification: "pending", path: kimiPath, sha256: sha256DirectoryTree(join(root, kimiPath)) };
+    Object.assign(payload, { candidateProviders: { kimi } });
+    await mkdir(releaseMetadata, { recursive: true });
+    const writeKimiManifest = async () => {
+      await writeManifest();
+      await cp(join(root, "provider-pack.json"), manifestPath);
+    };
+    await writeKimiManifest();
+    expect(readRemoteProviderPackManifest(root).payload.candidateProviders?.kimi).toEqual(kimi);
+    expect(readBundledRemoteProviderPackManifest(manifestPath).payload.candidateProviders?.kimi?.qualification).toBe("pending");
+    for (const field of ["version", "profileDigest", "closureDigest"] as const) {
+      const previous = kimi[field];
+      kimi[field] = field === "version" ? "older-kimi" : digest(`old-kimi-${field}`);
+      await writeKimiManifest();
+      expect(() => readRemoteProviderPackManifest(root)).toThrow("Kimi profile or closure");
+      expect(() => readBundledRemoteProviderPackManifest(manifestPath)).toThrow("Kimi profile or closure");
+      kimi[field] = previous;
+    }
+    kimi.closureDigest = `sha256:${KIMI_DISTRIBUTION_CLOSURE_SHA256["darwin-arm64"]}`;
+    await writeKimiManifest();
+    expect(() => readBundledRemoteProviderPackManifest(manifestPath)).toThrow("Kimi profile or closure");
+    kimi.closureDigest = `sha256:${KIMI_DISTRIBUTION_CLOSURE_SHA256["linux-x64"]}`;
+    for (const target of [{ platform: "linux", architecture: "arm64" }, { platform: "darwin", architecture: "arm64" }]) {
+      payload.target = target;
+      kimi.path = `provider-assets/kimi/${target.platform}-${target.architecture}`;
+      Object.assign(payload, { providers: {} });
+      await writeKimiManifest();
+      expect(() => readBundledRemoteProviderPackManifest(manifestPath)).toThrow("Kimi profile or closure");
+    }
+    payload.target = originalTarget;
+    kimi.path = kimiPath;
+    kimi.qualification = "qualified";
+    await writeKimiManifest();
+    expect(() => readBundledRemoteProviderPackManifest(manifestPath)).toThrow("invalid candidate identity");
+    kimi.qualification = "pending";
+    Object.assign(payload, { providers: { cursor, kimi: { ...kimi, qualification: "qualified" } } });
+    await writeKimiManifest();
+    expect(() => readBundledRemoteProviderPackManifest(manifestPath)).toThrow("invalid candidate identity");
+    Object.assign(payload, { providers: { cursor } });
+    await writeKimiManifest();
+    await writeFile(join(root, kimiPath, "runtime"), "substitute Kimi runtime");
+    expect(() => readRemoteProviderPackManifest(root)).toThrow("candidate asset tree digest mismatch");
+    await writeFile(join(root, kimiPath, "runtime"), "pinned Kimi runtime");
+    const fourCandidates = { kimi, cursor,
+      pi: { ...kimi, version: "1.0.0", qualification: "qualified", path: "provider-assets/pi/linux-x64" },
+      copilot: { ...kimi, version: QUALIFIED_ACPX_PROFILES.copilot.agentServerVersion,
+        profileDigest: QUALIFIED_ACPX_PROFILES.copilot.commandDigest,
+        closureDigest: "sha256:a3d8f4367cfa1694d79e3f8b7930b6fbfe42a229c272b375b11951d631db8d07",
+        path: "provider-assets/copilot/linux-x64" } };
+    for (const candidate of [fourCandidates.pi, fourCandidates.copilot]) {
+      await mkdir(join(root, candidate.path), { recursive: true });
+      await writeFile(join(root, candidate.path, "runtime"), "candidate runtime");
+      candidate.sha256 = sha256DirectoryTree(join(root, candidate.path));
+    }
+    Object.assign(payload, { candidateProviders: fourCandidates });
+    await writeKimiManifest();
+    expect(Object.keys(readRemoteProviderPackManifest(root).payload.candidateProviders!)).toHaveLength(4);
+    Object.assign(payload, { candidateProviders: { ...fourCandidates, unknown: kimi } });
+    await writeKimiManifest();
+    expect(() => readBundledRemoteProviderPackManifest(manifestPath)).toThrow("invalid candidate inventory");
+    Object.assign(payload, { candidateProviders: { unknown: kimi } });
+    await writeKimiManifest();
+    expect(() => readBundledRemoteProviderPackManifest(manifestPath)).toThrow("invalid candidate identity");
+    await rm(releaseMetadata, { recursive: true, force: true });
     const candidatePath = "provider-assets/pi/linux-x64";
     await mkdir(join(root, candidatePath), { recursive: true });
     await writeFile(join(root, candidatePath, "runtime"), "pinned runtime");
@@ -3773,10 +3844,10 @@ describe("runtime question fallback", () => {
 });
 
 describe("native provider bootstrap environment", () => {
-  it.each(["pi", "cursor", "copilot", "antigravity"] as const)("does not promote ambient %s credentials when bindings are omitted", agent => {
+  it.each(["pi", "cursor", "copilot", "antigravity", "kimi"] as const)("does not promote ambient %s credentials when bindings are omitted", agent => {
     const provider = { kind: "acpx", agent } as NativeExecutionInput["provider"];
     const host = { PATH: "/host/bin", HOME: "/host/home", OPENROUTER_API_KEY: "ambient-pi",
-      CURSOR_API_KEY: "ambient-cursor", CURSOR_AUTH_TOKEN: "ambient-cursor-login", COPILOT_GITHUB_TOKEN: "ambient-copilot",
+      CURSOR_API_KEY: "ambient-cursor", CURSOR_AUTH_TOKEN: "ambient-cursor-login", COPILOT_GITHUB_TOKEN: "ambient-copilot", KIMI_API_KEY: "ambient-kimi",
       GEMINI_API_KEY: "ambient-google", GOOGLE_API_KEY: "ambient-other-google", GEMINI_HOME: "/ambient-google-home",
       GOOGLE_APPLICATION_CREDENTIALS: "/ambient-google-credential.json", PAPERCLIP_ACPX_ANTIGRAVITY_AUTH_JSON_SECRET: "ambient-google-subscription",
       PAPERCLIP_ACPX_CREDENTIAL_BINDING: "ambient-forged-binding" };

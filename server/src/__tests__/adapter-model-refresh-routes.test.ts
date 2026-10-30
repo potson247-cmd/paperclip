@@ -183,6 +183,17 @@ describe("adapter model refresh route", () => {
     await unregisterTestAdapter(refreshableAdapterType);
   });
 
+  it("keeps native Kimi explicit model selection separate from other provider catalogs", async () => {
+    const app = await createApp();
+    const res = await requestApp(app, baseUrl =>
+      request(baseUrl).get("/api/companies/company-1/adapters/paperclip_runner/models?provider=acpx&acpxAgent=kimi&refresh=1"),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toEqual([]);
+    expect(mockListOpenCodeModels).not.toHaveBeenCalled();
+  });
+
   it("uses refreshModels when refresh=1 is requested", async () => {
     const listModels = vi.fn(async () => [{ id: "stale-model", label: "stale-model" }]);
     const refreshModels = vi.fn(async () => [{ id: "fresh-model", label: "fresh-model" }]);

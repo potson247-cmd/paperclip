@@ -407,7 +407,7 @@ export async function setupLiveFixtures(input: {
     || execution.task.flow === "finalization_recovery"
     || execution.task.flow === "followup_stop_resume"
     || execution.task.flow === "warm_three_turn"
-    || (execution.suite.id === "extended-harnesses" && execution.task.id === "file-edit-validate")) {
+    || (["extended-harnesses", "kimi-qualification"].includes(execution.suite.id) && execution.task.id === "file-edit-validate")) {
     registry.register<ProjectRecord>({
       id: "project",
       dependencies: ["company", "environment"],

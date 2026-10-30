@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
-import { ACPX_QUALIFICATION_ENV, resolveAcpxQualification } from "./acpx-qualification.js";
+import { ACPX_QUALIFICATION_ENV, ANTIGRAVITY_CANDIDATE_ADMISSION_ENV, resolveAcpxQualification, resolveKimiCandidateAdmission } from "./acpx-qualification.js";
+import { QUALIFIED_ACPX_PROFILES, KIMI_DISTRIBUTION_CLOSURE_SHA256 } from "../../vendor/paperclip-runner/index.js";
 import type { NativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
 import { resolvePaperclipRunnerProviderProfile, resolvePaperclipRunnerNativeProviderInput } from "./provider-profile.js";
 
@@ -8,6 +9,40 @@ const provider = { kind: "acpx", agent: "copilot", model: "exact-model", permiss
 const authorize = (value: unknown) => ({ [ACPX_QUALIFICATION_ENV]: JSON.stringify(value) });
 describe("host ACPX qualification admission", () => {
   afterEach(() => vi.unstubAllEnvs());
+
+  it("keeps Kimi closed despite the old host allowlist, saved configuration and agent environment", () => {
+    const config = { provider: "acpx", acpxAgent: "kimi", model: "kimi-for-coding",
+      candidateAdmission: kimiAdmission("linux", "x64"), env: { [ANTIGRAVITY_CANDIDATE_ADMISSION_ENV]: JSON.stringify(kimiAdmission("linux", "x64")) } };
+    vi.stubEnv(ANTIGRAVITY_CANDIDATE_ADMISSION_ENV, undefined);
+    vi.stubEnv(ACPX_QUALIFICATION_ENV, JSON.stringify([{ agent: "kimi", model: config.model }]));
+    expect(resolveAcpxQualification({ kind: "acpx", agent: "kimi", model: config.model }, process.env)).toBeUndefined();
+    expect(() => resolvePaperclipRunnerProviderProfile(config, { companyId: "candidate-company" }))
+      .toThrow(expect.objectContaining({ code: "paperclip_runner_acpx_agent_unavailable" }));
+    expect(() => resolvePaperclipRunnerProviderProfile({ ...config, model: "" }))
+      .toThrow(expect.objectContaining({ code: "paperclip_runner_acpx_model_required" }));
+  });
+
+  it.each([["darwin", "arm64"], ["linux", "x64"]] as const)("admits the exact trusted Kimi %s/%s target independently of controller host", (platform, architecture) => {
+    const admission = kimiAdmission(platform, architecture);
+    vi.stubEnv(ANTIGRAVITY_CANDIDATE_ADMISSION_ENV, JSON.stringify(admission));
+    const config = { provider: "acpx", acpxAgent: "kimi", model: admission.model };
+    expect(resolveKimiCandidateAdmission({ companyId: admission.companyId, model: admission.model, target: { platform, architecture } })).toEqual(admission);
+    expect(resolvePaperclipRunnerProviderProfile(config, { companyId: admission.companyId })).toMatchObject(config);
+    expect(resolvePaperclipRunnerNativeProviderInput({ companyId: admission.companyId, backend: "acpx_runtime", adapterConfig: config }))
+      .toMatchObject({ ...config, acpxPermissionMode: "approve-all" });
+    expect(resolveKimiCandidateAdmission({ companyId: "foreign-company", model: admission.model })).toBeUndefined();
+    expect(() => resolveKimiCandidateAdmission({ companyId: admission.companyId, model: admission.model, target: { platform: "linux", architecture: "arm64" } })).toThrow();
+  });
+
+  it.each([
+    { model: "another-model" }, { profileDigest: `sha256:${"0".repeat(64)}` },
+    { nativeClosureDigest: `sha256:${"0".repeat(64)}` }, { expiresAt: 0 },
+    { platform: "linux", architecture: "arm64" }, { allowAll: true },
+  ])("rejects mismatched trusted Kimi authority %j", change => {
+    const admission = kimiAdmission("linux", "x64");
+    vi.stubEnv(ANTIGRAVITY_CANDIDATE_ADMISSION_ENV, JSON.stringify({ ...admission, ...change }));
+    expect(() => resolveKimiCandidateAdmission({ companyId: admission.companyId, model: admission.model })).toThrow();
+  });
 
   it.each([undefined, "malformed", JSON.stringify([{ agent: "antigravity", model: "exact-model" }])])(
     "keeps pending Antigravity closed despite host authorization (%s)", host => {
@@ -97,3 +132,9 @@ it.each([undefined, "off", "low", "high", "max"] as const)("validates saved Pi t
   expect(resolvePaperclipRunnerNativeProviderInput({ backend: "acpx_runtime", adapterConfig })).toMatchObject({ piThinkingLevel: piThinkingLevel ?? "low" });
   for (const alias of ["medium", "minimal", "xhigh"]) expect(() => resolvePaperclipRunnerProviderProfile({ ...adapterConfig, piThinkingLevel: alias })).toThrow(expect.objectContaining({ code: "paperclip_runner_pi_thinking_invalid" }));
 });
+
+function kimiAdmission(platform: "darwin" | "linux", architecture: "arm64" | "x64") {
+  return { schema: "paperclip.acpx-candidate-admission.v1", companyId: "candidate-company", agent: "kimi", model: "kimi-for-coding",
+    platform, architecture, expiresAt: Date.now() + 60_000, profileDigest: QUALIFIED_ACPX_PROFILES.kimi.commandDigest,
+    nativeClosureDigest: `sha256:${KIMI_DISTRIBUTION_CLOSURE_SHA256[`${platform}-${architecture}` as "darwin-arm64" | "linux-x64"]}` };
+}
