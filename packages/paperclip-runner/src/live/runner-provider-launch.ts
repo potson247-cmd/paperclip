@@ -11,6 +11,10 @@ import type { DurableRecoveryIdentity } from "../contracts/durable-recovery.js";
 import type { NativeRuntimeContextSnapshot } from "../contracts/runtime-context.js";
 import type { CapabilityRunnerdCodexTransportOptions } from "./runnerd-codex-transport.js";
 
+// Environment plugins may advertise managed GitHub commands only with the
+// matching Runner source that preserves helper selectors through Claude ACPX.
+export const RUNNER_GITHUB_LAUNCHER_VERSION = 1;
+
 /** Core's provider inputs. Executable paths and filesystem layout are supplied separately. */
 export interface RunnerProviderLaunchRequirements {
   schema: "paperclip.runner.launch-requirements.v1";
