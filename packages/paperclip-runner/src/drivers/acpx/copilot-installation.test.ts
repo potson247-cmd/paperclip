@@ -87,9 +87,48 @@ vi.mock("./installation-integrity.js", () => ({ verifyNativeAcpxInstallation: vi
 
 describe("Copilot build-owned installation", () => {
   it("admits the current profile with environment launch preparation", () => {
-    expect(QUALIFIED_ACPX_PROFILES.copilot.agentProfileVersion).toBe(87);
+    expect(QUALIFIED_ACPX_PROFILES.copilot.agentProfileVersion).toBe(89);
     expect(QUALIFIED_ACPX_PROFILES.copilot.qualificationStatus).toBeUndefined();
-    expect(QUALIFIED_ACPX_PROFILES.copilot.commandDigest).toBe("sha256:ce2f4322cbc545932d6c725c57005eea1f44f2c743d5384c6ea90909563d958d");
+    expect(QUALIFIED_ACPX_PROFILES.copilot.commandDigest).toBe("sha256:4502feb20b925f88c3317f637962d38f8b8df7f1425a485c0f8e3526213fe52b");
+  });
+
+  it("preserves profile 88 while binding run attachment activity in profile 89", async () => {
+    const bytes = readFileSync(new URL("../../../test/fixtures/copilot-profile-v88-identity.json", import.meta.url));
+    expect(createHash("sha256").update(bytes).digest("hex")).toBe("6010dc772d914afec7dd31f35f953ce74b65ab3a648ce54aaee559f908b492f9");
+    const prior = JSON.parse(bytes.toString("utf8"));
+    const current = JSON.parse(readFileSync(new URL("../../../test/fixtures/copilot-profile-v89-identity.json", import.meta.url), "utf8"));
+    expect(Object.keys(current.declaration).filter(key => current.declaration[key] !== prior.declaration[key]).sort()).toEqual([
+      "agentProfileVersion", "harnessSessionSourceSha256", "profileCompatibilitySourceSha256", "runtimeRequestBridgeSourceSha256", "runtimeRequestFacadeSourceSha256",
+    ]);
+    expect(isSupportedAcpxProfileVersion("copilot", 88)).toBe(true);
+    await expect(verifyCopilotInstallation({ ...QUALIFIED_ACPX_PROFILES.copilot,
+      agentProfileVersion: 88, commandDigest: prior.commandDigest })).rejects.toThrow("exact pinned");
+  });
+
+  it("preserves profile 87 while binding merged operation timing in profile 88", async () => {
+    const bytes = readFileSync(new URL("../../../test/fixtures/copilot-profile-v87-cursor-cloud-qualification-historical-identity.json", import.meta.url));
+    expect(createHash("sha256").update(bytes).digest("hex")).toBe("ce9912c34ae9126e74061f7bc170b59589af7cb6ab26751e250da9e9dd9553c9");
+    const prior = JSON.parse(bytes.toString("utf8"));
+    const current = JSON.parse(readFileSync(new URL("../../../test/fixtures/copilot-profile-v88-identity.json", import.meta.url), "utf8"));
+    expect(Object.keys(current.declaration).filter(key => current.declaration[key] !== prior.declaration[key]).sort()).toEqual([
+      "agentProfileVersion", "profileCompatibilitySourceSha256", "runtimeRequestBridgeSourceSha256", "semanticSidecarSourceSha256",
+    ]);
+    expect(isSupportedAcpxProfileVersion("copilot", 87)).toBe(true);
+    await expect(verifyCopilotInstallation({ ...QUALIFIED_ACPX_PROFILES.copilot,
+      agentProfileVersion: 87, commandDigest: prior.commandDigest })).rejects.toThrow("exact pinned");
+  });
+
+  it("preserves profile 86 while binding rejected native completion in profile 87", async () => {
+    const bytes = readFileSync(new URL("../../../test/fixtures/copilot-profile-v86-cursor-cloud-qualification-historical-identity.json", import.meta.url));
+    expect(createHash("sha256").update(bytes).digest("hex")).toBe("118a4b0a782b56570e5530cca91255da8932c31f827c319b40a5810bd4d446e9");
+    const prior = JSON.parse(bytes.toString("utf8"));
+    const current = JSON.parse(readFileSync(new URL("../../../test/fixtures/copilot-profile-v87-cursor-cloud-qualification-historical-identity.json", import.meta.url), "utf8"));
+    expect(Object.keys(current.declaration).filter(key => current.declaration[key] !== prior.declaration[key]).sort()).toEqual([
+      "agentProfileVersion", "nativeSessionRuntimeSourceSha256", "profileCompatibilitySourceSha256",
+    ]);
+    expect(isSupportedAcpxProfileVersion("copilot", 86)).toBe(true);
+    await expect(verifyCopilotInstallation({ ...QUALIFIED_ACPX_PROFILES.copilot,
+      agentProfileVersion: 86, commandDigest: prior.commandDigest })).rejects.toThrow("exact pinned");
   });
 
 it("preserves published v65 while binding retained-maintenance waits in v66", async () => {

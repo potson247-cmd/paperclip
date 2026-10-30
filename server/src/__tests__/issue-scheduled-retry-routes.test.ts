@@ -580,6 +580,24 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
         .where(inArray(heartbeatRuns.id, work.map(row => row.id)));
       clock();
       const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => { throw error; } });
+      let firstBatch = false;
+      let enter!: () => void, release!: () => void;
+      const entered = new Promise<void>(resolve => { enter = resolve; });
+      const held = new Promise<void>(resolve => { release = resolve; });
+      const register = coordinator.register.bind(coordinator);
+      const registration = vi.spyOn(coordinator, "register").mockImplementation((queue, task) => register(queue, {
+        ...task,
+        run: async signal => {
+          const result = await task.run(signal);
+          const cancelled = firstBatch ? [] : (await states()).filter(row => row.status === "cancelled");
+          if (cancelled.length) {
+            firstBatch = true;
+            enter();
+            await held;
+          }
+          return result;
+        },
+      }));
       try {
         await heartbeatService(db, { runtimeEnv: {} }).registerScheduledRetryCancellationWork(coordinator, () => true).ready;
         expect((await states()).filter(row => row.status === "cancelled")).toHaveLength(0);
@@ -587,9 +605,11 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
         await writeIntent({ companyId: a.companyId, retryRunId: earlierId });
         work.push({ id: earlierId });
         await vi.advanceTimersByTimeAsync(1000);
+        await entered;
         await expect.poll(async () => (await states()).filter(row => row.status === "cancelled").length).toBe(20);
         const initial = (await states()).filter(row => row.status === "cancelled");
         expect(new Set(initial.map(row => row.companyId)).size).toBe(2);
+        release();
         await vi.waitFor(async () => {
           await vi.advanceTimersByTimeAsync(1000);
           expect((await states()).filter(row => row.status === "cancelled")).toHaveLength(29);
@@ -600,7 +620,7 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
         const reads = vi.spyOn(db, "select");
         await vi.advanceTimersByTimeAsync(180_000);
         expect(reads).not.toHaveBeenCalled(); reads.mockRestore();
-      } finally { await coordinator.stop(); }
+      } finally { release(); registration.mockRestore(); await coordinator.stop(); }
     });
   });
 
