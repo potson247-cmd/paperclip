@@ -38,6 +38,13 @@ existing campaigns. Private Cloud bundles are rejected. The output contains
 only index HTML and history/pointer JSON; it does not upload evidence or change
 retained campaign bundles.
 
+The explicit-only [Cursor Cloud native cells](../tests/runner-e2e/README.md)
+cover task/artifact delivery, same-agent follow-up, active-run UI Stop and
+semantic Plan revision/approval from a local controller. They require explicit
+model/repository/key and a callback-only
+public HTTPS proxy. Controlled tests and discovery do not qualify hosted work.
+These cells remain private because raw evidence can contain provider session IDs.
+
 The explicit-only [chat feature evals](../tests/runner-e2e/CHAT-FEATURES.md) promote
 two natural-language task scenarios into local native Product E2E cells. They
 verify saving an unstarted task and delegating a saved announcement back to chat,

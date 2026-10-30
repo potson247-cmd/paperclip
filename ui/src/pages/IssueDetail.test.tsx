@@ -50,6 +50,7 @@ import type { issuesApi } from "../api/issues";
 // These page fixtures exercise Classic task behavior. Preference identity and
 // persistence have their own hook tests; keep their readiness explicit here.
 const coordinatorPreference = vi.hoisted(() => ({ enabled: false, loaded: true }));
+const inlineEditorFixture = vi.hoisted(() => ({ real: false }));
 vi.mock("../hooks/useCoordinatorWorkspaceEnabled", () => ({
   useCoordinatorWorkspaceEnabled: () => coordinatorPreference,
 }));
@@ -352,15 +353,14 @@ vi.mock("@/plugins/launchers", () => ({
   PluginLauncherOutlet: () => null,
 }));
 
-vi.mock("../components/InlineEditor", () => ({
-  InlineEditor: ({
-    value,
-    placeholder,
-  }: {
-    value?: string;
-    placeholder?: string;
-  }) => <div>{value || placeholder}</div>,
-}));
+vi.mock("../components/InlineEditor", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../components/InlineEditor")>();
+  return {
+    InlineEditor: (props: Parameters<typeof actual.InlineEditor>[0]) => inlineEditorFixture.real
+      ? <actual.InlineEditor {...props} />
+      : <div>{props.value || props.placeholder}</div>,
+  };
+});
 
 vi.mock("../components/IssueChatThread", () => ({
   IssueChatThread: (props: {
@@ -1333,6 +1333,7 @@ describe("IssueDetail", () => {
 
   beforeEach(() => {
     Object.assign(coordinatorPreference, { enabled: false, loaded: true });
+    inlineEditorFixture.real = false;
     localStorage.clear();
     sessionStorage.clear();
     mockPanelState.panelVisible = true;
@@ -1556,6 +1557,119 @@ describe("IssueDetail", () => {
     coordinatorPreference.loaded = true;
     await act(async () => renderIssueView());
     await waitForAssertion(() => expect(mockIssueChatThreadRender).toHaveBeenCalled());
+  });
+
+  it.each(["save", "failure", "escape", "unchanged", "navigate"])("retains the early title through preference readiness until %s", async (exit) => {
+    inlineEditorFixture.real = true;
+    coordinatorPreference.loaded = false;
+    const issue = createIssue();
+    const save = createDeferred<Issue>();
+    mockIssuesApi.get.mockResolvedValue(issue);
+    mockIssuesApi.update.mockReset().mockReturnValue(save.promise);
+    mockAuthApi.getSession.mockResolvedValue({ user: { id: "title-editor-user" } });
+    queryClient.setQueryData(queryKeys.auth.session, { user: { id: "title-editor-user" } });
+    await act(async () => renderIssueView());
+    await waitForAssertion(() => expect(container.querySelector('[data-testid="issue-detail-header"] h2')).not.toBeNull());
+    await act(async () => (container.querySelector('[data-testid="issue-detail-header"] h2') as HTMLElement).click());
+    const input = container.querySelector<HTMLTextAreaElement>('[data-testid="issue-detail-header"] textarea')!;
+    expect(input).not.toBeNull();
+    expect(document.activeElement).toBe(input);
+    coordinatorPreference.loaded = true;
+    await act(async () => renderIssueView());
+    expect(container.querySelector('[data-testid="issue-detail-header"] textarea')).toBe(input);
+    expect(document.activeElement).toBe(input);
+    expect(input.value).toBe(issue.title);
+    expect(mockIssueChatThreadRender).not.toHaveBeenCalled();
+
+    if (exit === "navigate") {
+      const next = createIssue({ id: "issue-2", identifier: "PAP-2", title: "Another task" });
+      mockIssuesApi.get.mockResolvedValue(next);
+      mockRouteParams.issueId = "PAP-2";
+      mockLocation.pathname = "/issues/PAP-2";
+      await act(async () => renderIssueView());
+      await waitForAssertion(() => expect(mockIssueChatThreadRender).toHaveBeenCalled());
+      expect(container.textContent).toContain(next.title);
+      expect(input.isConnected).toBe(false);
+      expect(mockIssuesApi.update).not.toHaveBeenCalled();
+      return;
+    }
+    if (exit === "save" || exit === "failure") {
+      await act(async () => {
+        const previous = input.value;
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(input, "Retained title draft");
+        (input as HTMLTextAreaElement & { _valueTracker?: { setValue(value: string): void } })._valueTracker?.setValue(previous);
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+    }
+    await act(async () => { input.dispatchEvent(new KeyboardEvent("keydown", { key: exit === "escape" ? "Escape" : "Enter", bubbles: true })); });
+    if (exit === "save" || exit === "failure") {
+      await waitForAssertion(() => expect(mockIssuesApi.update).toHaveBeenCalledWith("PAP-1", { title: "Retained title draft" }));
+      expect(container.querySelector('[data-testid="issue-detail-header"] textarea')).toBe(input);
+      if (exit === "failure") {
+        await act(async () => save.reject(new Error("Title save unavailable")));
+        expect(container.querySelector('[data-testid="issue-detail-header"] textarea')).toBe(input);
+        expect(input.value).toBe("Retained title draft");
+        expect(mockIssueChatThreadRender).not.toHaveBeenCalled();
+        return;
+      }
+      const updated = { ...issue, title: "Retained title draft" };
+      mockIssuesApi.get.mockResolvedValue(updated);
+      await act(async () => save.resolve(updated));
+    } else {
+      expect(mockIssuesApi.update).not.toHaveBeenCalled();
+    }
+    await waitForAssertion(() => expect(mockIssueChatThreadRender).toHaveBeenCalled());
+    expect(container.querySelector('[data-testid="issue-detail-header"] textarea')).toBeNull();
+    expect(container.textContent).toContain(exit === "save" ? "Retained title draft" : issue.title);
+  });
+
+  it("retires an early title edit when navigating to a cached task with preferences still pending", async () => {
+    inlineEditorFixture.real = true;
+    coordinatorPreference.loaded = false;
+    const first = createIssue();
+    const second = createIssue({ id: "issue-2", identifier: "PAP-2", title: "Cached second task" });
+    mockIssuesApi.get.mockImplementation(async (id) => id === "PAP-2" ? second : first);
+    mockIssuesApi.update.mockReset();
+    mockAuthApi.getSession.mockResolvedValue({ user: { id: "pending-route-user" } });
+    queryClient.setQueryData(queryKeys.auth.session, { user: { id: "pending-route-user" } });
+    queryClient.setQueryData(queryKeys.issues.detail("PAP-2"), second);
+    queryClient.setQueryData([...queryKeys.issues.detail("PAP-2"), "core"], second);
+    queryClient.setQueryData(["issues", "history-expanded", "PAP-2"], true);
+    const type = (input: HTMLTextAreaElement, value: string) => {
+      const previous = input.value;
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(input, value);
+      (input as HTMLTextAreaElement & { _valueTracker?: { setValue(value: string): void } })._valueTracker?.setValue(previous);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    };
+    await act(async () => renderIssueView());
+    await waitForAssertion(() => expect(container.querySelector('[data-testid="issue-detail-header"] h2')).not.toBeNull());
+    await act(async () => (container.querySelector('[data-testid="issue-detail-header"] h2') as HTMLElement).click());
+    const firstInput = container.querySelector<HTMLTextAreaElement>('[data-testid="issue-detail-header"] textarea')!;
+    await act(async () => type(firstInput, "Only the first task's draft"));
+    mockRouteParams.issueId = "PAP-2";
+    mockLocation.pathname = "/issues/PAP-2";
+    await act(async () => renderIssueView());
+    expect(firstInput.isConnected, "the cached destination must retire the first task's editor").toBe(false);
+    expect(container.querySelector('[data-testid="issue-detail-header"] textarea')).toBeNull();
+    const secondHeading = container.querySelector<HTMLElement>('[data-testid="issue-detail-header"] h2')!;
+    expect(secondHeading.textContent).toBe(second.title);
+    await act(async () => secondHeading.click());
+    const secondInput = container.querySelector<HTMLTextAreaElement>('[data-testid="issue-detail-header"] textarea')!;
+    expect(secondInput.value).toBe(second.title);
+    await act(async () => type(secondInput, "Only the second task's draft"));
+    coordinatorPreference.loaded = true;
+    await act(async () => renderIssueView());
+    expect(container.querySelector('[data-testid="issue-detail-header"] textarea')).toBe(secondInput);
+    expect(document.activeElement).toBe(secondInput);
+    expect(secondInput.value).toBe("Only the second task's draft");
+    expect(mockIssueChatThreadRender).not.toHaveBeenCalled();
+    await act(async () => { secondInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); });
+    await waitForAssertion(() => expect(mockIssueChatThreadRender).toHaveBeenCalled());
+    expect(container.textContent).toContain(second.title);
+    expect(container.textContent).not.toContain("Only the first task's draft");
+    expect(localStorage.getItem("paperclip:inline-draft:v2:pending-route-user:issue:issue-1:title")).toContain("Only the first task's draft");
+    expect(localStorage.getItem("paperclip:inline-draft:v2:pending-route-user:issue:issue-2:title")).toBeNull();
+    expect(mockIssuesApi.update).not.toHaveBeenCalled();
   });
 
   it("uses Coordinator task presentation and panel scope without changing the Classic preference", async () => {

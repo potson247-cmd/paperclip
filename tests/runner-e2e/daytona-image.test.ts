@@ -11,10 +11,12 @@ import {
 } from "./daytona-image-content.js";
 
 const repositoryRoot = path.resolve(import.meta.dirname, "../..");
-function lastDockerignoreRule(dockerignore: string, fixturePath: string) {
+function lastMatchingDockerignoreRule(dockerignore: string, fixturePath: string) {
+  const segments = fixturePath.split("/");
+  const ancestors = segments.map((_, index) => segments.slice(0, index + 1).join("/"));
   return dockerignore.split(/\r?\n/).filter(rule => rule && !rule.startsWith("#")).filter(rule => {
-    const pattern = rule.startsWith("!") ? rule.slice(1) : rule;
-    return path.matchesGlob(fixturePath, pattern) || fixturePath.startsWith(`${pattern}/`);
+    const pattern = rule.replace(/^!/, "").replace(/^\//, "");
+    return ancestors.some(candidate => path.matchesGlob(candidate, pattern));
   }).at(-1);
 }
 
@@ -30,7 +32,7 @@ describe("runner E2E Daytona image contract", () => {
     expect(DAYTONA_IMAGE_INPUT_PATHS).toContain(fixturePath);
     await expect(readFile(path.join(repositoryRoot, fixturePath), "utf8")).resolves.toContain('"commandDigest"');
     // Docker's last matching rule wins, including the parent-directory exclusion.
-    const lastRule = lastDockerignoreRule(dockerignore, fixturePath);
+    const lastRule = lastMatchingDockerignoreRule(dockerignore, fixturePath);
     expect(lastRule?.startsWith("!")).toBe(true);
     // The exception also covers the next version without exposing other live evidence.
     const exception = lastRule!.slice(1);
@@ -146,12 +148,14 @@ describe("runner E2E Daytona image contract", () => {
     expect(await readFile(path.join(repositoryRoot, ".github/docker-context-checks.Dockerfile"), "utf8")).toContain("node packages/paperclip-runner/scripts/generate-acpx-profiles.mjs --check");
     for (const declaration of [
       "test-fixtures/pi-acp/profile-v19-identity.json",
+      "test-fixtures/pi-acp/profile-v34-identity.json",
       "test/fixtures/copilot-profile-v16-identity.json",
+      "test/fixtures/copilot-profile-v82-identity.json",
     ]) {
-      expect(lastDockerignoreRule(dockerignore, `packages/paperclip-runner/${declaration}`)?.startsWith("!")).toBe(true);
+      expect(lastMatchingDockerignoreRule(dockerignore, `packages/paperclip-runner/${declaration}`)?.startsWith("!")).toBe(true);
       await expect(readFile(path.join(repositoryRoot, "packages/paperclip-runner", declaration), "utf8")).resolves.toBeTruthy();
     }
-    expect(lastDockerignoreRule(dockerignore, "packages/paperclip-runner/test-fixtures/pi-acp/private-live-session.json")?.startsWith("!")).toBe(false);
+    expect(lastMatchingDockerignoreRule(dockerignore, "packages/paperclip-runner/test-fixtures/pi-acp/private-live-session.json")?.startsWith("!")).toBe(false);
     for (const developmentOnlyInput of [
       "packages/paperclip-runner/devtools",
       "packages/paperclip-runner/docs",
@@ -165,6 +169,18 @@ describe("runner E2E Daytona image contract", () => {
       "packages/paperclip-runner/scripts/*-smoke.mjs",
     ]) {
       expect(dockerignore).toContain(developmentOnlyInput);
+    }
+    for (const developmentOnlyFile of [
+      "devtools/probe.mjs",
+      "docs/development.md",
+      "examples/demo.ts",
+      "test/fixtures/copilot-live-denial.json",
+      "test-fixtures/pi-acp/live-evidence.json",
+      "test-support/helpers.ts",
+      "runner/crates/runner/tests/contract.rs",
+      "scripts/pi-smoke.mjs",
+    ]) {
+      expect(lastMatchingDockerignoreRule(dockerignore, `packages/paperclip-runner/${developmentOnlyFile}`)?.startsWith("!")).toBe(false);
     }
     expect(workflow).toContain("--platform linux/amd64");
     expect(workflow).toContain(
