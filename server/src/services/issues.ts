@@ -127,6 +127,7 @@ import type {
   IssueReviewAttentionPath,
   IssueBlockedInboxAttention,
   IssueBlockedInboxIssueRef,
+  IssueBlockedInboxOwner,
   IssueRelationIssueSummary,
   IssueWatchdogSummary,
   LowTrustBoundary,
@@ -140,6 +141,7 @@ import {
   issueCommentMetadataSchema,
   issueCommentPresentationSchema,
   isAgentCreatedIssue,
+  isAgentInvokable,
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
@@ -5661,6 +5663,75 @@ function compareBlockedInboxRows(
   return right.id.localeCompare(left.id);
 }
 
+function blockedChainOwner(
+  row: IssueRow,
+  terminalBlockerIssueId: string | null | undefined,
+  issuesById: Map<string, IssueRow>,
+  interactionByIssueId: Map<string, BlockedInboxInteractionRow>,
+  approvalByIssueId: Map<string, BlockedInboxApprovalRow>,
+): IssueBlockedInboxOwner {
+  const unknown: IssueBlockedInboxOwner = {
+    type: "unknown",
+    agentId: null,
+    userId: null,
+    label: null,
+  };
+  const terminal = terminalBlockerIssueId
+    ? issuesById.get(terminalBlockerIssueId)
+    : undefined;
+  if (terminal && terminal.id !== row.id && terminal.visibility !== "open") {
+    return unknown;
+  }
+  const actor = terminal ?? row;
+  const agent = (agentId: string): IssueBlockedInboxOwner => ({
+    type: "agent",
+    agentId,
+    userId: null,
+    label: null,
+  });
+  const user = (userId: string): IssueBlockedInboxOwner => ({
+    type: "user",
+    agentId: null,
+    userId,
+    label: null,
+  });
+  const board: IssueBlockedInboxOwner = {
+    type: "board",
+    agentId: null,
+    userId: null,
+    label: "Board",
+  };
+  if (interactionByIssueId.has(actor.id) || approvalByIssueId.has(actor.id)) {
+    return board;
+  }
+  const hasMonitor = Boolean(
+    actor.monitorNextCheckAt && actor.monitorNextCheckAt.getTime() > Date.now(),
+  );
+  if (
+    actor.status === "blocked" &&
+    !hasMonitor &&
+    externalWaitFromDescription(actor.description)
+  ) {
+    return { type: "external", agentId: null, userId: null, label: null };
+  }
+  const descriptorOwner =
+    actor.status === "blocked" ? actor.unblockDescriptor?.owner : undefined;
+  if (descriptorOwner === "board") return board;
+  if (descriptorOwner && "agentId" in descriptorOwner) return agent(descriptorOwner.agentId);
+  if (descriptorOwner && "userId" in descriptorOwner) return user(descriptorOwner.userId);
+  if (actor.status === "in_review") {
+    const participant = parseObject(actor.executionState).currentParticipant;
+    if (participant && typeof participant === "object" && !Array.isArray(participant)) {
+      const { agentId, userId } = participant as Record<string, unknown>;
+      if (typeof agentId === "string") return agent(agentId);
+      if (typeof userId === "string") return user(userId);
+    }
+  }
+  if (actor.assigneeAgentId) return agent(actor.assigneeAgentId);
+  if (actor.assigneeUserId) return user(actor.assigneeUserId);
+  return unknown;
+}
+
 async function listIssueBlockedInboxAttentionMap(
   dbOrTx: any,
   companyId: string,
@@ -6282,19 +6353,41 @@ async function listIssueBlockedInboxAttentionMap(
       (blockerState?.state === "needs_attention" ||
         blockerState?.state === "stalled")
     ) {
+      const owner = blockedChainOwner(
+        row,
+        blockerState.terminalBlockerIssueId,
+        issuesById,
+        interactionByIssueId,
+        approvalByIssueId,
+      );
+      const ownerAgent = owner.agentId
+        ? companyAgents.find((candidate) => candidate.id === owner.agentId)
+        : undefined;
+      const ownerCannotRun =
+        owner.type === "agent" &&
+        (!ownerAgent ||
+          !isAgentInvokable({ agent: ownerAgent, agents: companyAgents }));
       result.set(
         row.id,
         attentionBase({
           state: "needs_attention",
-          reason: "blocked_chain_stalled",
-          severity: "high",
+          reason: ownerCannotRun
+            ? "blocked_by_uninvokable_assignee"
+            : "blocked_chain_stalled",
+          severity: ownerCannotRun ? "critical" : "high",
           stoppedSinceAt: row.updatedAt,
-          owner: { type: "unknown", agentId: null, userId: null, label: null },
-          action: {
-            label: "Inspect blocker chain",
-            detail:
-              "Inspect the stalled blocker or review leaf and make the next owner/action explicit.",
-          },
+          owner,
+          action: ownerCannotRun
+            ? {
+                label: "Assign active owner",
+                detail:
+                  "The next owner of this blocker chain cannot run. Assign an active owner or replace the blocker.",
+              }
+            : {
+                label: "Inspect blocker chain",
+                detail:
+                  "Inspect the stalled blocker or review leaf and make the next owner/action explicit.",
+              },
           sourceIssue: source,
           sampleIssueIdentifier:
             blockerState.sampleStalledBlockerIdentifier ??
