@@ -958,7 +958,10 @@ impl AcpxCommandExecutor {
                 )))
             }
         };
-        if self.candidate_admission().is_some() {
+        if self
+            .candidate_admission()
+            .is_some_and(|admission| admission.agent == "antigravity")
+        {
             return Err(DurableRunnerError::invalid(
                 "ACPX candidate cannot adopt a prior durable runner activation",
             ));
@@ -1218,7 +1221,10 @@ impl AcpxCommandExecutor {
     }
 
     fn attach_run(&mut self, payload: &Value) -> Result<(), DurableRunnerError> {
-        if self.candidate_admission().is_some() {
+        if self
+            .candidate_admission()
+            .is_some_and(|admission| admission.agent == "antigravity")
+        {
             return Err(DurableRunnerError::invalid(
                 "ACPX candidate cannot rotate or adopt a live runner authority",
             ));
@@ -1258,6 +1264,37 @@ impl AcpxCommandExecutor {
             attachment_context.run_id = run_id.to_owned();
         }
         descriptor.validate(&attachment_context)?;
+        let next_candidate = if let Some(admission) = self
+            .candidate_admission()
+            .filter(|admission| admission.agent == "kimi")
+        {
+            let proposed: crate::acpx_candidate_admission::AcpxCandidateAdmission =
+                serde_json::from_value(
+                    payload
+                        .pointer("/paperclipNextAuthority/candidateAdmission")
+                        .cloned()
+                        .ok_or_else(|| {
+                            DurableRunnerError::invalid(
+                                "Kimi run.attach requires exact trusted candidate admission",
+                            )
+                        })?,
+                )
+                .map_err(|_| {
+                    DurableRunnerError::invalid("Kimi run.attach candidate admission is invalid")
+                })?;
+            admission
+                .validate_next_run(
+                    &proposed,
+                    &descriptor.agent,
+                    &descriptor.model,
+                    &descriptor.run_id,
+                    &descriptor.normalized_session_id,
+                )
+                .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+            Some(proposed)
+        } else {
+            None
+        };
         let tool_set = authorized_tool_set(payload)?;
         let state = self
             .state
@@ -1327,10 +1364,18 @@ impl AcpxCommandExecutor {
                 })?;
         }
         self.session = None;
+        if let Some(admission) = next_candidate {
+            self.launch_profile
+                .as_mut()
+                .expect("candidate launch profile remains available")
+                .candidate_admission = Some(admission);
+        }
+        let launch_profile_digest = self.launch_profile_digest()?;
         let state = self
             .state
             .as_mut()
             .expect("ACPX state remains available while attaching a run");
+        state.launch_profile_digest = launch_profile_digest;
         state.descriptor = descriptor;
         state.tool_set = tool_set;
         state.semantic_result = None;
@@ -2032,7 +2077,10 @@ impl AcpxCommandExecutor {
     }
 
     fn suspend(&mut self) -> Result<CommandExecution, DurableRunnerError> {
-        if self.candidate_admission().is_some() {
+        if self
+            .candidate_admission()
+            .is_some_and(|admission| admission.agent == "antigravity")
+        {
             return self.close_session("candidate runner.suspend retires the owned process");
         }
         if self
@@ -2270,7 +2318,9 @@ fn goal_terminal_disposition<'a>(
 impl CommandExecutor for AcpxCommandExecutor {
     fn execute(&mut self, command: &Command) -> Result<CommandExecution, DurableRunnerError> {
         self.restore()?;
-        if self.candidate_admission().is_some()
+        if self
+            .candidate_admission()
+            .is_some_and(|admission| admission.agent == "antigravity")
             && command.command_type == "run.attach"
             && command.payload.get("paperclipNextAuthority").is_some()
         {
@@ -2346,6 +2396,12 @@ impl CommandExecutor for AcpxCommandExecutor {
         self.context.normalized_session_id = config.normalized_session_id.clone();
         self.context.turn_id = config.turn_id.clone();
         self.context.item_id = config.item_id.clone();
+        if self
+            .candidate_admission()
+            .is_some_and(|admission| admission.agent == "kimi")
+        {
+            self.launch_profile = config.acpx_launch_profile.clone();
+        }
     }
 
     fn poll_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
@@ -3351,7 +3407,7 @@ mod tests {
     #[test]
     fn pi_profile_matches_published_identity_and_rejects_prior_profiles() {
         let published: Value = serde_json::from_str(include_str!(
-            "../../../../test-fixtures/pi-acp/profile-v35-identity.json"
+            "../../../../test-fixtures/pi-acp/profile-v36-identity.json"
         ))
         .unwrap();
         let mut value = descriptor("codex");
@@ -3368,6 +3424,10 @@ mod tests {
         current.validate(&context()).unwrap();
 
         for prior in [
+            include_str!("../../../../test-fixtures/pi-acp/profile-v35-identity.json"),
+            include_str!(
+                "../../../../test-fixtures/pi-acp/profile-v35-kimi-historical-identity.json"
+            ),
             include_str!("../../../../test-fixtures/pi-acp/profile-v34-identity.json"),
             include_str!("../../../../test-fixtures/pi-acp/profile-v33-identity.json"),
             include_str!("../../../../test-fixtures/pi-acp/profile-v32-identity.json"),
@@ -4853,5 +4913,140 @@ mod tests {
         ];
         drop(listeners.pop());
         (candidates, listeners)
+    }
+    #[test]
+    #[cfg(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    ))]
+    fn kimi_candidate_attachment_atomically_rebinds_exact_grant_and_profile_digest() {
+        let directory = temporary_directory("kimi-candidate-attachment");
+        let mut grant = crate::acpx_candidate_admission::test_admission("run-1", "session-1");
+        grant.agent = "kimi".to_owned();
+        grant.model = "explicit-test-model".to_owned();
+        grant.profile_digest = acpx_release_profile("kimi")
+            .unwrap()
+            .command_digest
+            .to_owned();
+        grant.platform = if cfg!(target_os = "macos") {
+            "darwin"
+        } else {
+            "linux"
+        }
+        .to_owned();
+        grant.architecture = if cfg!(target_os = "macos") {
+            "arm64"
+        } else {
+            "x64"
+        }
+        .to_owned();
+        grant.native_closure_digest = format!(
+            "sha256:{}",
+            crate::generated_acpx_profiles::kimi_native_closure(
+                &grant.platform,
+                &grant.architecture
+            )
+            .unwrap()
+        );
+        let command = directory.join("owned-sidecar");
+        write_artifact(&command, b"#!/bin/sh\nexit 1\n", true);
+        let profile = AcpxLaunchProfile {
+            candidate_admission: Some(grant.clone()),
+            authority_digest: format!("sha256:{}", "d".repeat(64)),
+            command: command.clone(),
+            args: vec![],
+            artifacts: vec![artifact(&command)],
+        };
+        let runtime = directory.join("runtime");
+        let workspace = directory.join("workspace");
+        fs::create_dir_all(&runtime).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&workspace, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut value = descriptor("kimi");
+        value["runtimeDirectory"] = json!(runtime);
+        value["cwd"] = json!(workspace);
+        value["sidecarCommand"] = json!(command);
+        value["sidecarArgs"] = json!([]);
+        let desc: AcpxProviderDescriptor = serde_json::from_value(value.clone()).unwrap();
+        let identity = AcpxProviderSessionIdentity {
+            kind: "acpx".to_owned(),
+            normalized_session_id: "session-1".to_owned(),
+            acpx_record_id: "record-1".to_owned(),
+            backend_session_id: "backend-1".to_owned(),
+            agent_session_id: "agent-1".to_owned(),
+            profile_digest: desc.command_digest.clone(),
+            workspace_digest: format!("sha256:{}", "a".repeat(64)),
+            requested_model: desc.model.clone(),
+            effective_model: desc.model.clone(),
+            permission_mode: Some(desc.permission_mode),
+            mode: None,
+            pi_thinking_level: None,
+            claude_effort: None,
+            grok_effort: None,
+            grok_disable_web_search: None,
+            provider_lifetime_fence_candidates: [60_001, 60_002, 60_003],
+        };
+        let operations = Vec::new();
+        let tools = AuthorizedToolSet {
+            schema: TOOL_SET_SCHEMA.to_owned(),
+            schema_version: 1,
+            catalog_digest: authorized_tool_catalog_digest(&operations).unwrap(),
+            operations,
+        };
+        let previous_digest = profile.canonical_digest().unwrap();
+        let mut state = AcpxDurableState::new(desc, tools, previous_digest.clone());
+        state.lifecycle = "suspended".to_owned();
+        state.identity = Some(identity);
+        let config = test_config(&directory, Some(profile));
+        let mut executor = AcpxCommandExecutor::with_runner_config(&directory, &config);
+        executor.state = Some(state);
+        executor.save_state().unwrap();
+        let before = fs::read(executor.state_path()).unwrap();
+        let mut next = grant.clone();
+        next.run_id = "run-2".to_owned();
+        let mut provider = value;
+        provider["runId"] = json!("run-2");
+        let payload = json!({"provider":provider,"paperclipNextAuthority":{
+            "identity":{"runId":"run-2","normalizedSessionId":"session-1"},"candidateAdmission":next
+        }});
+        for (field, changed) in [
+            ("companyId", json!("foreign")),
+            ("model", json!("wrong")),
+            ("expiresAt", json!(grant.expires_at + 1)),
+            ("runId", json!("unbound")),
+        ] {
+            let mut invalid = payload.clone();
+            invalid["paperclipNextAuthority"]["candidateAdmission"][field] = changed;
+            assert!(executor.attach_run(&invalid).is_err(), "{field}");
+            assert_eq!(fs::read(executor.state_path()).unwrap(), before);
+        }
+        assert!(executor.attach_run(&json!({"provider":provider})).is_err());
+        executor.attach_run(&payload).unwrap();
+        let updated = executor.state.as_ref().unwrap();
+        assert_eq!(updated.descriptor.run_id, "run-2");
+        assert_eq!(executor.context.run_id, "run-1");
+        let profile = executor.launch_profile.as_ref().unwrap();
+        assert_eq!(profile.candidate_admission.as_ref().unwrap(), &next);
+        assert_ne!(updated.launch_profile_digest, previous_digest);
+        assert_eq!(
+            updated.launch_profile_digest,
+            profile.canonical_digest().unwrap()
+        );
+        let launch = updated
+            .descriptor
+            .session_config(
+                updated.tool_set.clone(),
+                updated.identity.clone(),
+                Some(profile),
+            )
+            .unwrap();
+        assert_eq!(launch.candidate_admission.as_ref().unwrap(), &next);
+        let saved: AcpxDurableState =
+            serde_json::from_slice(&fs::read(executor.state_path()).unwrap()).unwrap();
+        assert_eq!(saved.descriptor.run_id, "run-2");
+        assert_eq!(saved.launch_profile_digest, updated.launch_profile_digest);
+        assert!(executor.session.is_none());
+        fs::remove_dir_all(directory).unwrap();
     }
 }

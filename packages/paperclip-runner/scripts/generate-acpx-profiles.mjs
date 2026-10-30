@@ -1,3 +1,5 @@
+import { KIMI_DISTRIBUTION_CLOSURE_SHA256 } from "../src/drivers/acpx/kimi-closure-pins.ts";
+import { kimiProfileIdentity, KIMI_PROFILE_VERSION } from "./kimi-profile-identity.mjs";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
@@ -18,6 +20,10 @@ assert.deepEqual(await readJson(`test/fixtures/grok-profile-v${GROK_PROFILE_VERS
 assert.equal(manifest.profiles.grok.agentProfileVersion, GROK_PROFILE_VERSION);
 assert.equal(manifest.profiles.grok.commandDigest, grokIdentity.commandDigest);
 assert.equal(`sha256:${createHash("sha256").update(await readFile(new URL("src/providers/grok/launcher.cjs", root))).digest("hex")}`, grokIdentity.commandDigest, "Grok launcher source stamp is stale");
+const kimiIdentity = kimiProfileIdentity();
+assert.deepEqual(await readJson(`test/fixtures/kimi-profile-v${KIMI_PROFILE_VERSION}-identity.json`), kimiIdentity, "Kimi source identity is stale; advance its profile before regeneration");
+assert.equal(manifest.profiles.kimi.agentProfileVersion, KIMI_PROFILE_VERSION);
+assert.equal(manifest.profiles.kimi.commandDigest, kimiIdentity.commandDigest);
 const entries = Object.entries(manifest.profiles);
 for (const [agent, profile] of entries) {
   assert.match(agent, /^[a-z]+$/);
@@ -94,6 +100,13 @@ pub(crate) struct AcpxReleaseProfile {
     pub command_digest: &'static str,
     pub requires_provider_policy: bool,
     pub qualification_pending: bool,
+}
+
+pub(crate) fn kimi_native_closure(platform: &str, architecture: &str) -> Option<&'static str> {
+    match (platform, architecture) {
+${Object.entries(KIMI_DISTRIBUTION_CLOSURE_SHA256).map(([target, digest]) => { const [platform, architecture] = target.split("-"); return `        (${quote(platform)}, ${quote(architecture)}) => {\n            Some(${quote(digest)})\n        }`; }).join("\n")}
+        _ => None,
+    }
 }
 
 pub(crate) fn acpx_release_profile(agent: &str) -> Option<AcpxReleaseProfile> {

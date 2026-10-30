@@ -13,6 +13,18 @@ pub(crate) struct AcpxReleaseProfile {
     pub qualification_pending: bool,
 }
 
+pub(crate) fn kimi_native_closure(platform: &str, architecture: &str) -> Option<&'static str> {
+    match (platform, architecture) {
+        ("darwin", "arm64") => {
+            Some("6038325abd0431c30097ff1f572a9b29816e1b4da372d8cb86b2ca5d18ea34e7")
+        }
+        ("linux", "x64") => {
+            Some("105d8394adbbc76a953a12cc51b5288eb940ad693291e584f6cdc6407213164d")
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn acpx_release_profile(agent: &str) -> Option<AcpxReleaseProfile> {
     Some(match agent {
         "antigravity" => AcpxReleaseProfile {
@@ -31,7 +43,7 @@ pub(crate) fn acpx_release_profile(agent: &str) -> Option<AcpxReleaseProfile> {
             agent_runtime_package: Some("native:grok"),
             agent_runtime_version: Some("1.0.13"),
             command_digest:
-                "sha256:ca59edc7f416cc1e86ac7d7d1e288d3d91065b7ab59e79bcb62bae5f0cc5cf49",
+                "sha256:4d6b4c857ba6e63a3eb8c5c406280e4bd0164d3109c940918392c52868bb4263",
             requires_provider_policy: false,
             qualification_pending: false,
         },
@@ -41,7 +53,7 @@ pub(crate) fn acpx_release_profile(agent: &str) -> Option<AcpxReleaseProfile> {
             agent_runtime_package: Some("@earendil-works/pi-coding-agent"),
             agent_runtime_version: Some("1.0.0"),
             command_digest:
-                "sha256:9473de6ef4baf2bd82fe8b6757239bdc160960b0a78ae6f47fa9e0996544226c",
+                "sha256:5186e5acd48dd5f951ee62656be9e266d05e880127fb1d8d6f26161e444770af",
             requires_provider_policy: true,
             qualification_pending: false,
         },
@@ -61,7 +73,7 @@ pub(crate) fn acpx_release_profile(agent: &str) -> Option<AcpxReleaseProfile> {
             agent_runtime_package: None,
             agent_runtime_version: None,
             command_digest:
-                "sha256:ce2f4322cbc545932d6c725c57005eea1f44f2c743d5384c6ea90909563d958d",
+                "sha256:995381b2cec7a0faf3f5cefbe2421eae7936a2bfa50bb153645f57341f968db3",
             requires_provider_policy: true,
             qualification_pending: false,
         },
@@ -84,6 +96,16 @@ pub(crate) fn acpx_release_profile(agent: &str) -> Option<AcpxReleaseProfile> {
                 "sha256:443491f4e814501a5dc47347e4510e84faeec9c9382e2d4e53bfe69386d5aabc",
             requires_provider_policy: false,
             qualification_pending: false,
+        },
+        "kimi" => AcpxReleaseProfile {
+            agent_server_package: "@moonshot-ai/kimi-code",
+            agent_server_version: "2.3.3",
+            agent_runtime_package: None,
+            agent_runtime_version: None,
+            command_digest:
+                "sha256:d917ef7222b71c8dbe1df46c33f7a439f15492db862307aa6b5427bf82ed196b",
+            requires_provider_policy: true,
+            qualification_pending: true,
         },
         _ => return None,
     })
